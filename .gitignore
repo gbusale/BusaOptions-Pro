@@ -1,17 +1,9 @@
-# Entorno virtual
 .venv/
-
-# Credenciales
 config/credentials.toml
-
-# Caché de Python
+config/app_password.txt
 __pycache__/
 *.pyc
-
-# VSCode
-.vscode/
-
-# Streamlit
 .streamlit/
-
+.vscode/
+.cache/
 data/
