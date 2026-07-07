@@ -1,78 +1,36 @@
-# \# 📈 BusaOptions Pro 5.5
+# 📈 BusaOptions Pro 8.0
 
-# 
+Versión Busa AI.
 
-# Plataforma profesional para análisis de opciones del mercado argentino.
+## Incluye
 
-# 
+- Señal actual con predicción dominante.
+- Confianza del modelo.
+- Estrategia sugerida según escenario.
+- Learning factor visible.
+- Accuracy histórico.
+- Razones técnicas del diagnóstico.
+- Base vs probabilidad ajustada por Learning.
+- Evaluación automática de señales pendientes.
+- Señales guardadas para entrenamiento futuro.
+- Puntas TOP.
+- Estrategias de opciones y payoff.
+- Black-Scholes, VI, VH, griegas y Score Busa.
+- Acceso privado.
 
-# \## Características
+## Cómo interpretar Busa AI
 
-# 
+- Learning factor = 1.00: modelo neutral.
+- Learning factor > 1.00: refuerza la predicción dominante.
+- Learning factor < 1.00: modera la predicción dominante.
+- Accuracy histórico: mide si las señales evaluadas están acertando.
 
-# \- ✅ Actualización manual desde IOL
+## Streamlit Cloud Secrets
 
-# \- ✅ Black-Scholes
+```toml
+APP_PASSWORD = "TU_CLAVE"
 
-# \- ✅ Volatilidad Implícita (VI)
-
-# \- ✅ Volatilidad Histórica (VH)
-
-# \- ✅ Valor Intrínseco y Extrínseco
-
-# \- ✅ Griegas (Delta, Gamma, Vega y Theta)
-
-# \- ✅ Score Busa
-
-# \- ✅ Ranking de oportunidades
-
-# \- ✅ Probabilidades de suba, baja y lateral
-
-# \- ✅ Dashboard para PC y celular
-
-# \- ✅ Protección mediante contraseña
-
-# \- ✅ Optimizado para Streamlit Cloud
-
-# 
-
-# \## Instalación
-
-# 
-
-# ```bash
-
-# pip install -r requirements.txt
-
-# streamlit run app.py
-
-# ```
-
-# 
-
-# \## Tecnologías
-
-# 
-
-# \- Python
-
-# \- Streamlit
-
-# \- Plotly
-
-# \- Pandas
-
-# \- NumPy
-
-# \- SciPy
-
-# \- API InvertirOnline
-
-# 
-
-# \## Autor
-
-# 
-
-# Gastón Ariel Busale
-
+[IOL]
+username = "TU_USUARIO_IOL"
+password = "TU_PASSWORD_IOL"
+```

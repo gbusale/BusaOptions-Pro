@@ -82,3 +82,19 @@ class IOLClient:
 
     def get_options(self, simbolo: str, mercado: str = "bCBA"):
         return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Opciones")
+
+    def get_quote(self, simbolo: str, mercado: str = "bCBA"):
+        """
+        Cotización individual de un título u opción.
+        Ejemplos:
+        - GGAL
+        - GFGC8600AG
+        """
+        return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion")
+
+    def get_history(self, simbolo: str, fecha_desde: str, fecha_hasta: str, ajustada: str = "SinAjustar", mercado: str = "bCBA"):
+        """
+        Serie histórica IOL.
+        Formato fechas esperado por IOL: YYYY-MM-DD o el formato que acepte la API.
+        """
+        return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion/seriehistorica/{fecha_desde}/{fecha_hasta}/{ajustada}")
