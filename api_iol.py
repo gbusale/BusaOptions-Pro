@@ -2,14 +2,11 @@ import requests
 import tomllib
 from pathlib import Path
 
-
 class IOLAuthError(Exception):
     pass
 
-
 class IOLApiError(Exception):
     pass
-
 
 class IOLClient:
     BASE_URL = "https://api.invertironline.com"
@@ -40,11 +37,7 @@ class IOLClient:
     def login(self):
         resp = requests.post(
             f"{self.BASE_URL}/token",
-            data={
-                "username": self.username,
-                "password": self.password,
-                "grant_type": "password",
-            },
+            data={"username": self.username, "password": self.password, "grant_type": "password"},
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=20,
         )
@@ -87,14 +80,5 @@ class IOLClient:
     def get_quote(self, simbolo: str, mercado: str = "bCBA"):
         return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion")
 
-    def get_history(
-        self,
-        simbolo: str,
-        fecha_desde: str,
-        fecha_hasta: str,
-        ajustada: str = "SinAjustar",
-        mercado: str = "bCBA",
-    ):
-        return self.get(
-            f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion/seriehistorica/{fecha_desde}/{fecha_hasta}/{ajustada}"
-        )
+    def get_history(self, simbolo: str, fecha_desde: str, fecha_hasta: str, ajustada: str = "SinAjustar", mercado: str = "bCBA"):
+        return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion/seriehistorica/{fecha_desde}/{fecha_hasta}/{ajustada}")

@@ -12,6 +12,20 @@ from scipy.optimize import brentq
 import plotly.graph_objects as go
 from api_iol import IOLClient, IOLAuthError, IOLApiError
 
+
+# =========================
+# Compatibilidad API IOL
+# =========================
+if not hasattr(IOLClient, "get_quote"):
+    def _iol_get_quote(self, simbolo: str, mercado: str = "bCBA"):
+        return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion")
+    IOLClient.get_quote = _iol_get_quote
+
+if not hasattr(IOLClient, "get_history"):
+    def _iol_get_history(self, simbolo: str, fecha_desde: str, fecha_hasta: str, ajustada: str = "SinAjustar", mercado: str = "bCBA"):
+        return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion/seriehistorica/{fecha_desde}/{fecha_hasta}/{ajustada}")
+    IOLClient.get_history = _iol_get_history
+
 st.set_page_config(page_title="BusaOptions Pro", layout="wide")
 
 # =========================
@@ -78,7 +92,7 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.1.1")
+st.title("BusaOptions Pro 9.1.2")
 st.caption("IOL + Black-Scholes + Busa AI + Advisor 9.1 + Learning claro.")
 
 TICKERS = {
