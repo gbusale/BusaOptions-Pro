@@ -1,13 +1,15 @@
-
 import requests
 import tomllib
 from pathlib import Path
 
+
 class IOLAuthError(Exception):
     pass
 
+
 class IOLApiError(Exception):
     pass
+
 
 class IOLClient:
     BASE_URL = "https://api.invertironline.com"
@@ -19,10 +21,6 @@ class IOLClient:
 
     @classmethod
     def from_config(cls, path: str = "config/credentials.toml"):
-        """
-        En Streamlit Cloud lee st.secrets.
-        En local lee config/credentials.toml.
-        """
         try:
             import streamlit as st
             if "IOL" in st.secrets:
@@ -33,8 +31,10 @@ class IOLClient:
         p = Path(path)
         if not p.exists():
             raise FileNotFoundError("No encontré credenciales locales ni Streamlit Secrets.")
+
         with p.open("rb") as f:
             cfg = tomllib.load(f)
+
         return cls(cfg["IOL"]["username"], cfg["IOL"]["password"])
 
     def login(self):
@@ -48,8 +48,9 @@ class IOLClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=20,
         )
+
         if resp.status_code != 200:
-            raise IOLAuthError(f"HTTP {resp.status_code}: {resp.text[:600]}")
+            raise IOLAuthError(f"Login IOL HTTP {resp.status_code}: {resp.text[:800]}")
 
         payload = resp.json()
         self.access_token = payload.get("access_token")
@@ -76,7 +77,7 @@ class IOLClient:
             )
 
         if not (200 <= resp.status_code < 300):
-            raise IOLApiError(f"GET {endpoint} -> HTTP {resp.status_code}: {resp.text[:800]}")
+            raise IOLApiError(f"GET {endpoint} -> HTTP {resp.status_code}: {resp.text[:1000]}")
 
         return resp.json()
 
@@ -84,17 +85,16 @@ class IOLClient:
         return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Opciones")
 
     def get_quote(self, simbolo: str, mercado: str = "bCBA"):
-        """
-        Cotización individual de un título u opción.
-        Ejemplos:
-        - GGAL
-        - GFGC8600AG
-        """
         return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion")
 
-    def get_history(self, simbolo: str, fecha_desde: str, fecha_hasta: str, ajustada: str = "SinAjustar", mercado: str = "bCBA"):
-        """
-        Serie histórica IOL.
-        Formato fechas esperado por IOL: YYYY-MM-DD o el formato que acepte la API.
-        """
-        return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion/seriehistorica/{fecha_desde}/{fecha_hasta}/{ajustada}")
+    def get_history(
+        self,
+        simbolo: str,
+        fecha_desde: str,
+        fecha_hasta: str,
+        ajustada: str = "SinAjustar",
+        mercado: str = "bCBA",
+    ):
+        return self.get(
+            f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion/seriehistorica/{fecha_desde}/{fecha_hasta}/{ajustada}"
+        )

@@ -78,8 +78,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 8.0")
-st.caption("IOL + Black-Scholes + Busa AI + Estrategias + Puntas TOP.")
+st.title("BusaOptions Pro 9.1.1")
+st.caption("IOL + Black-Scholes + Busa AI + Advisor 9.1 + Learning claro.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL"},
@@ -409,6 +409,57 @@ def evaluate_pending_predictions_auto(activo, hist_df, lateral_threshold):
     return count
 
 
+def learning_status_text(row):
+    try:
+        evaluated = int(float(row.get("Evaluada", 0)))
+    except Exception:
+        evaluated = 0
+    if evaluated != 1:
+        return "⏳ Pendiente"
+    try:
+        hit = int(float(row.get("Acierto", 0)))
+    except Exception:
+        hit = 0
+    return "✅ Acertó" if hit == 1 else "❌ Falló"
+
+def add_learning_status_columns(df):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    d["Estado aprendizaje"] = d.apply(learning_status_text, axis=1)
+    def msg(row):
+        if row.get("Estado aprendizaje") == "⏳ Pendiente":
+            return f"Predijo {row.get('Predicción')} y todavía no hay cierre posterior evaluado."
+        return f"Predijo {row.get('Predicción')}; resultado real {row.get('Resultado')}; variación {clean_num(row.get('Variación %')):.2f}%."
+    d["Lectura"] = d.apply(msg, axis=1)
+    return d
+
+def evaluate_single_prediction_manual(row_index, close_price, eval_date, lateral_threshold):
+    df = load_predictions()
+    if df.empty or row_index not in df.index:
+        return False, "No encontré la señal."
+
+    initial = clean_num(df.loc[row_index, "Precio inicial"])
+    if np.isnan(initial) or initial <= 0:
+        return False, "Precio inicial inválido."
+
+    variation = close_price / initial - 1
+    result = "Sube" if variation > lateral_threshold else "Baja" if variation < -lateral_threshold else "Lateral"
+    pred = str(df.loc[row_index, "Predicción"])
+    hit = int(result == pred)
+
+    df.loc[row_index, "Evaluada"] = 1
+    df.loc[row_index, "Fecha evaluación"] = eval_date
+    df.loc[row_index, "Precio cierre"] = close_price
+    df.loc[row_index, "Variación %"] = variation * 100
+    df.loc[row_index, "Resultado"] = result
+    df.loc[row_index, "Acierto"] = hit
+    save_predictions(df)
+
+    message = f"Predijo {pred}. Resultado real {result}. {'Acertó' if hit else 'Falló'}."
+    return True, message
+
+
 def busa_ai_confidence_label(prob_dict):
     max_prob = max(float(prob_dict.get("Sube", 0)), float(prob_dict.get("Baja", 0)), float(prob_dict.get("Lateral", 0)))
     if max_prob >= 0.70:
@@ -421,10 +472,26 @@ def busa_ai_confidence_label(prob_dict):
 
 def busa_ai_recommended_strategy(prediction, confidence):
     if prediction == "Sube":
-        return "Bull Call Spread" if confidence in ["Media", "Alta"] else "Call comprado"
+        return "Call comprado" if confidence in ["Alta", "Muy alta"] else "Bull Call Spread"
     if prediction == "Baja":
-        return "Bear Put Spread" if confidence in ["Media", "Alta"] else "Put comprado"
+        return "Put comprado" if confidence in ["Alta", "Muy alta"] else "Bear Put Spread"
     return "Estrategia lateral / esperar"
+
+def option_strategy_suggestions(prediction, confidence):
+    if prediction == "Sube":
+        return [
+            {"Estrategia": "Call comprado", "Escenario": "Alcista fuerte", "Ganancia": "Ilimitada teórica", "Pérdida máxima": "Prima pagada", "Comentario": "Mayor potencial, pero alto theta si no sube rápido."},
+            {"Estrategia": "Bull Call Spread", "Escenario": "Alcista moderado", "Ganancia": "Limitada", "Pérdida máxima": "Costo neto", "Comentario": "Reduce costo y riesgo, limita ganancia."},
+        ]
+    if prediction == "Baja":
+        return [
+            {"Estrategia": "Put comprado", "Escenario": "Bajista fuerte", "Ganancia": "Alta, limitada por subyacente a cero", "Pérdida máxima": "Prima pagada", "Comentario": "Mayor potencial bajista, pero pierde por theta."},
+            {"Estrategia": "Bear Put Spread", "Escenario": "Bajista moderado", "Ganancia": "Limitada", "Pérdida máxima": "Costo neto", "Comentario": "Reduce costo y riesgo, limita ganancia."},
+        ]
+    return [
+        {"Estrategia": "No operar / esperar", "Escenario": "Lateral o baja convicción", "Ganancia": "No aplica", "Pérdida máxima": "0", "Comentario": "Preservar capital también es estrategia."},
+        {"Estrategia": "Straddle / Strangle comprado", "Escenario": "Movimiento fuerte sin dirección clara", "Ganancia": "Alta si se mueve fuerte", "Pérdida máxima": "Primas pagadas", "Comentario": "Necesita movimiento grande para compensar costo."},
+    ]
 
 def busa_ai_reason_cards(prob_dict, hv, S, hist_df):
     feats = technical_features(hist_df)
@@ -926,6 +993,55 @@ def leg_payoff(price, typ, K, premium, side, qty=1):
         val = -val
     return val * qty
 
+def strategy_metrics(payoff, net_cost):
+    max_gain = float(np.nanmax(payoff))
+    max_loss = float(np.nanmin(payoff))
+    risk_capital = abs(float(net_cost)) if abs(float(net_cost)) > 0 else abs(max_loss)
+    loss_pct = abs(max_loss) / risk_capital * 100 if risk_capital and risk_capital > 0 else np.nan
+    unlimited_upside = payoff[-1] > payoff[-2] and payoff[-1] > payoff[len(payoff)//2]
+    return {"max_gain": max_gain, "max_loss": max_loss, "risk_capital": risk_capital, "loss_pct": loss_pct, "unlimited_upside": unlimited_upside}
+
+def first_valid_price(row):
+    for col in ["Prima usada", "Último", "Venta", "Compra"]:
+        val = clean_num(row.get(col))
+        if not np.isnan(val) and val > 0:
+            return float(val)
+    return np.nan
+
+def estimate_strategy_success(strategy_type, breakeven, S, prob_dict):
+    """
+    Estimación educativa simple:
+    usa la dirección dominante + distancia al break-even.
+    Luego se podrá reemplazar por modelo entrenado.
+    """
+    if S <= 0 or breakeven is None or np.isnan(breakeven):
+        return np.nan
+
+    if strategy_type in ["Call comprado", "Bull Call Spread"]:
+        base = float(prob_dict.get("Sube", 0))
+        distance_penalty = max(0, (breakeven / S - 1)) * 2.0
+        return max(0, min(1, base - distance_penalty))
+
+    if strategy_type in ["Put comprado", "Bear Put Spread"]:
+        base = float(prob_dict.get("Baja", 0))
+        distance_penalty = max(0, (1 - breakeven / S)) * 2.0
+        return max(0, min(1, base - distance_penalty))
+
+    return float(prob_dict.get("Lateral", 0))
+
+
+# =========================
+# Motor de payoff / estrategias
+# =========================
+def leg_payoff(price, typ, K, premium, side, qty=1):
+    if typ == "call":
+        val = np.maximum(price - K, 0) - premium
+    else:
+        val = np.maximum(K - price, 0) - premium
+    if side == "sell":
+        val = -val
+    return val * qty
+
 def strategy_payoff(legs, prices):
     total = np.zeros_like(prices, dtype=float)
     net_cost = 0.0
@@ -933,6 +1049,177 @@ def strategy_payoff(legs, prices):
         total += leg_payoff(prices, typ, K, premium, side, qty)
         net_cost += premium * qty * (1 if side == "buy" else -1)
     return total, net_cost
+
+def strategy_metrics(payoff, net_cost):
+    max_gain = float(np.nanmax(payoff))
+    max_loss = float(np.nanmin(payoff))
+    risk_capital = abs(float(net_cost)) if abs(float(net_cost)) > 0 else abs(max_loss)
+    loss_pct = abs(max_loss) / risk_capital * 100 if risk_capital and risk_capital > 0 else np.nan
+    unlimited_upside = payoff[-1] > payoff[-2] and payoff[-1] > payoff[len(payoff)//2]
+    return {
+        "max_gain": max_gain,
+        "max_loss": max_loss,
+        "risk_capital": risk_capital,
+        "loss_pct": loss_pct,
+        "unlimited_upside": unlimited_upside,
+    }
+
+def build_strategy_advisor(analyzed, S, prob_dict, max_loss_pct_limit=100):
+    """
+    Strategy Advisor 9.1.
+    Evalúa estrategias educativas con opciones disponibles:
+    - Call comprado
+    - Put comprado
+    - Bull Call Spread
+    - Bear Put Spread
+    - Long Straddle
+    - Long Strangle
+    - Long Call Butterfly
+    - Long Iron Condor / expectativa lateral
+    """
+    if analyzed is None or analyzed.empty:
+        return pd.DataFrame()
+
+    df = analyzed.copy()
+    df["prima_ref"] = df.apply(first_valid_price, axis=1)
+    df = df.dropna(subset=["prima_ref", "Strike", "Score Busa"])
+    df = df[df["prima_ref"] > 0]
+    if df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    prices = np.linspace(S * 0.65, S * 1.40, 350)
+    pred = dominant_prediction(prob_dict)
+
+    calls = df[df["Tipo"] == "CALL"].sort_values("Strike")
+    puts = df[df["Tipo"] == "PUT"].sort_values("Strike")
+
+    def add_row(strategy, t1, t2, t3, t4, escenario, ganancia, legs, breakeven, success, score_base, comment):
+        payoff, net_cost = strategy_payoff(legs, prices)
+        m = strategy_metrics(payoff, net_cost)
+        roi = abs(m["max_gain"] / abs(m["max_loss"])) if m["max_loss"] else np.nan
+        strategy_score = (
+            score_base * 0.45 +
+            (success * 100 if not np.isnan(success) else 45) * 0.35 +
+            min(20, roi * 8 if not np.isnan(roi) else 0)
+        )
+        if m["unlimited_upside"]:
+            strategy_score += 12
+        rows.append({
+            "Ranking": "",
+            "Estrategia": strategy,
+            "Ticker 1": t1,
+            "Ticker 2": t2,
+            "Ticker 3": t3,
+            "Ticker 4": t4,
+            "Escenario": escenario,
+            "Ganancia": ganancia,
+            "Costo neto": net_cost,
+            "Pérdida máx.": m["max_loss"],
+            "% pérdida/capital": m["loss_pct"],
+            "Break-even": breakeven,
+            "Prob. éxito est. %": success * 100 if not np.isnan(success) else np.nan,
+            "Score estrategia": strategy_score,
+            "Comentario": comment,
+        })
+
+    # Long calls: upside ilimitado
+    if pred == "Sube" and not calls.empty:
+        candidate_calls = calls[(calls["Strike"] >= S * 0.92) & (calls["Strike"] <= S * 1.18)].sort_values("Score Busa", ascending=False).head(10)
+        for _, c in candidate_calls.iterrows():
+            K = float(c["Strike"]); p = float(c["prima_ref"])
+            legs = [("buy", "call", K, p, 1)]
+            breakeven = K + p
+            success = estimate_strategy_success("Call comprado", breakeven, S, prob_dict)
+            add_row("Call comprado", c["Ticker"], "", "", "", "Alcista fuerte", "Ilimitada teórica", legs, breakeven, success, float(c["Score Busa"]), "Mayor potencial alcista. Riesgo limitado a prima.")
+
+    # Long puts
+    if pred == "Baja" and not puts.empty:
+        candidate_puts = puts[(puts["Strike"] >= S * 0.82) & (puts["Strike"] <= S * 1.08)].sort_values("Score Busa", ascending=False).head(10)
+        for _, p_row in candidate_puts.iterrows():
+            K = float(p_row["Strike"]); p = float(p_row["prima_ref"])
+            legs = [("buy", "put", K, p, 1)]
+            breakeven = K - p
+            success = estimate_strategy_success("Put comprado", breakeven, S, prob_dict)
+            add_row("Put comprado", p_row["Ticker"], "", "", "", "Bajista fuerte", "Alta, limitada por subyacente a cero", legs, breakeven, success, float(p_row["Score Busa"]), "Potencial bajista con riesgo limitado a prima.")
+
+    # Bull call spreads
+    if pred == "Sube" and len(calls) >= 2:
+        base_calls = calls[(calls["Strike"] >= S * 0.92) & (calls["Strike"] <= S * 1.10)].sort_values("Score Busa", ascending=False).head(6)
+        for _, buy in base_calls.iterrows():
+            higher = calls[calls["Strike"] > buy["Strike"]].head(5)
+            for _, sell in higher.iterrows():
+                p_buy = float(buy["prima_ref"]); p_sell = float(sell["prima_ref"]); net = p_buy - p_sell
+                if net <= 0: continue
+                legs = [("buy", "call", float(buy["Strike"]), p_buy, 1), ("sell", "call", float(sell["Strike"]), p_sell, 1)]
+                breakeven = float(buy["Strike"]) + net
+                success = estimate_strategy_success("Bull Call Spread", breakeven, S, prob_dict)
+                score_base = np.nanmean([buy["Score Busa"], sell["Score Busa"]])
+                add_row("Bull Call Spread", buy["Ticker"], sell["Ticker"], "", "", "Alcista moderado", "Limitada", legs, breakeven, success, score_base, "Menor costo y menor riesgo que call comprado.")
+
+    # Bear put spreads
+    if pred == "Baja" and len(puts) >= 2:
+        base_puts = puts[(puts["Strike"] >= S * 0.90) & (puts["Strike"] <= S * 1.08)].sort_values("Score Busa", ascending=False).head(6)
+        for _, buy in base_puts.iterrows():
+            lower = puts[puts["Strike"] < buy["Strike"]].tail(5)
+            for _, sell in lower.iterrows():
+                p_buy = float(buy["prima_ref"]); p_sell = float(sell["prima_ref"]); net = p_buy - p_sell
+                if net <= 0: continue
+                legs = [("buy", "put", float(buy["Strike"]), p_buy, 1), ("sell", "put", float(sell["Strike"]), p_sell, 1)]
+                breakeven = float(buy["Strike"]) - net
+                success = estimate_strategy_success("Bear Put Spread", breakeven, S, prob_dict)
+                score_base = np.nanmean([buy["Score Busa"], sell["Score Busa"]])
+                add_row("Bear Put Spread", buy["Ticker"], sell["Ticker"], "", "", "Bajista moderado", "Limitada", legs, breakeven, success, score_base, "Menor costo y menor riesgo que put comprado.")
+
+    # Straddle / Strangle long for movement
+    if len(calls) >= 1 and len(puts) >= 1:
+        near_calls = calls.iloc[(calls["Strike"] - S).abs().argsort()[:4]]
+        near_puts = puts.iloc[(puts["Strike"] - S).abs().argsort()[:4]]
+        for _, c in near_calls.iterrows():
+            for _, p_row in near_puts.iterrows():
+                pc = float(c["prima_ref"]); pp = float(p_row["prima_ref"])
+                legs = [("buy", "call", float(c["Strike"]), pc, 1), ("buy", "put", float(p_row["Strike"]), pp, 1)]
+                total_p = pc + pp
+                if abs(float(c["Strike"]) - float(p_row["Strike"])) < 1e-9:
+                    strat = "Long Straddle"
+                    bkeven = np.nan
+                else:
+                    strat = "Long Strangle"
+                    bkeven = np.nan
+                score_base = np.nanmean([c["Score Busa"], p_row["Score Busa"]])
+                success = max(float(prob_dict.get("Sube", 0)), float(prob_dict.get("Baja", 0))) if pred != "Lateral" else np.nan
+                add_row(strat, c["Ticker"], p_row["Ticker"], "", "", "Movimiento fuerte", "Ilimitada al alza / alta a la baja", legs, bkeven, success, score_base, "Apuesta a movimiento fuerte. Riesgo limitado a primas.")
+
+    # Butterfly with calls: lateral / target
+    if len(calls) >= 3:
+        strikes = sorted(calls["Strike"].unique())
+        for i in range(1, len(strikes)-1):
+            k1, k2, k3 = strikes[i-1], strikes[i], strikes[i+1]
+            if abs((k2-k1) - (k3-k2)) > 1e-6:
+                continue
+            if not (S*0.90 <= k2 <= S*1.10):
+                continue
+            r1 = calls[calls["Strike"] == k1].sort_values("Score Busa", ascending=False).head(1)
+            r2 = calls[calls["Strike"] == k2].sort_values("Score Busa", ascending=False).head(1)
+            r3 = calls[calls["Strike"] == k3].sort_values("Score Busa", ascending=False).head(1)
+            if r1.empty or r2.empty or r3.empty:
+                continue
+            r1, r2, r3 = r1.iloc[0], r2.iloc[0], r3.iloc[0]
+            legs = [
+                ("buy", "call", float(k1), float(r1["prima_ref"]), 1),
+                ("sell", "call", float(k2), float(r2["prima_ref"]), 2),
+                ("buy", "call", float(k3), float(r3["prima_ref"]), 1),
+            ]
+            score_base = np.nanmean([r1["Score Busa"], r2["Score Busa"], r3["Score Busa"]])
+            add_row("Long Call Butterfly", r1["Ticker"], r2["Ticker"], r3["Ticker"], "", "Lateral / objetivo cercano", "Limitada", legs, np.nan, float(prob_dict.get("Lateral", 0)), score_base, "Riesgo definido. Busca cierre cerca del strike central.")
+            break
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("Score estrategia", ascending=False).reset_index(drop=True)
+    out["Ranking"] = np.arange(1, len(out)+1)
+    return out
 
 # =========================
 # Sidebar
@@ -1110,7 +1397,7 @@ if not df_options.empty:
 # =========================
 # UI
 # =========================
-tabs = st.tabs(["Dashboard", "Opciones", "Probabilidades", "Busa AI", "Estrategias", "Velas", "Favoritos"])
+tabs = st.tabs(["Dashboard", "Opciones", "Probabilidades", "Busa AI", "Advisor", "Estrategias", "Velas", "Favoritos"])
 
 with tabs[0]:
     st.subheader(f"Dashboard {activo}")
@@ -1192,6 +1479,7 @@ with tabs[3]:
     p3.metric("Lateral", f"{prob['Lateral']:.1%}")
 
     st.markdown("### Aprendizaje visible")
+    st.caption("Evaluada=0 significa pendiente. Cuando se evalúa, Resultado y Acierto muestran si predijo bien o mal.")
     l1, l2, l3 = st.columns(3)
     l1.metric("Learning factor", f"{prob.get('Learning factor', 1.0):.2f}")
     l2.metric("Señales evaluadas", n_eval)
@@ -1203,6 +1491,9 @@ with tabs[3]:
         st.success("El modelo está reforzando la predicción dominante porque el historial viene acompañando.")
     else:
         st.warning("El modelo está moderando la predicción dominante porque el historial viene fallando.")
+
+    st.markdown("### Estrategias sugeridas por Busa AI")
+    st.dataframe(pd.DataFrame(option_strategy_suggestions(pred, confidence)), use_container_width=True)
 
     st.markdown("### Por qué Busa AI interpreta esto")
     reasons = busa_ai_reason_cards(prob, hv, S, h)
@@ -1239,7 +1530,7 @@ with tabs[3]:
         d = df_pred[df_pred["Activo"] == activo].copy()
         if not d.empty:
             st.markdown("### Señales guardadas")
-            st.dataframe(d.tail(50), use_container_width=True)
+            st.dataframe(add_learning_status_columns(d).tail(50), use_container_width=True)
 
             if not d_eval.empty:
                 by_pred = d_eval.groupby("Predicción")["Acierto"].mean().reset_index()
@@ -1288,9 +1579,82 @@ with tabs[3]:
             st.rerun()
 
 
+
 with tabs[4]:
-    st.subheader("Estrategias de opciones")
-    st.caption("Biblioteca educativa + gráfico de payoff. No es recomendación financiera personalizada.")
+    st.subheader("Strategy Advisor 9.0")
+    st.caption("Motor educativo basado en estrategias clásicas: long call/put, spreads, straddle, strangle y butterfly. Busca alternativas con opciones disponibles y rankea riesgo/beneficio.")
+
+    if analyzed.empty:
+        st.warning("Primero cargá opciones con Actualizar mercado (IOL).")
+    else:
+        pred_adv = dominant_prediction(prob)
+        confidence_adv = busa_ai_confidence_label(prob)
+        st.info(f"Escenario detectado: **{pred_adv}** | Confianza: **{confidence_adv}**")
+
+        max_loss_pct = st.slider("Referencia máxima de pérdida sobre capital (%)", 10, 200, 100, 5)
+        advisor = build_strategy_advisor(analyzed, S, prob, max_loss_pct)
+
+        if advisor.empty:
+            st.warning("No encontré estrategias suficientes con los datos actuales. Probá actualizar puntas TOP o revisar primas.")
+        else:
+            best = advisor.iloc[0]
+            st.markdown("### Recomendación Busa")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Estrategia", best["Estrategia"])
+            c2.metric("Ticker principal", best["Ticker 1"])
+            c3.metric("Score estrategia", f"{best['Score estrategia']:.0f}")
+            c4.metric("Prob. éxito est.", "" if pd.isna(best["Prob. éxito est. %"]) else f"{best['Prob. éxito est. %']:.1f}%")
+
+            st.write(f"**Comentario:** {best['Comentario']}")
+            st.write(f"**Ganancia:** {best['Ganancia']}")
+            st.write(f"**Pérdida máxima estimada:** {best['Pérdida máx.']:.2f}")
+            if not pd.isna(best["% pérdida/capital"]):
+                st.write(f"**% pérdida sobre capital arriesgado:** {best['% pérdida/capital']:.1f}%")
+            if not pd.isna(best["Break-even"]):
+                st.write(f"**Break-even:** {best['Break-even']:.2f}")
+
+            st.markdown("### Ranking de estrategias")
+            st.dataframe(advisor.head(20), use_container_width=True)
+
+            # Payoff de la estrategia ganadora
+            prices_adv = np.linspace(S * 0.70, S * 1.35, 300)
+            legs_adv = []
+            if best["Estrategia"] == "Call comprado":
+                row = analyzed[analyzed["Ticker"] == best["Ticker 1"]].iloc[0]
+                legs_adv = [("buy", "call", float(row["Strike"]), float(first_valid_price(row)), 1)]
+            elif best["Estrategia"] == "Put comprado":
+                row = analyzed[analyzed["Ticker"] == best["Ticker 1"]].iloc[0]
+                legs_adv = [("buy", "put", float(row["Strike"]), float(first_valid_price(row)), 1)]
+            elif best["Estrategia"] == "Bull Call Spread":
+                r1 = analyzed[analyzed["Ticker"] == best["Ticker 1"]].iloc[0]
+                r2 = analyzed[analyzed["Ticker"] == best["Ticker 2"]].iloc[0]
+                legs_adv = [
+                    ("buy", "call", float(r1["Strike"]), float(first_valid_price(r1)), 1),
+                    ("sell", "call", float(r2["Strike"]), float(first_valid_price(r2)), 1),
+                ]
+            elif best["Estrategia"] == "Straddle/Strangle comprado":
+                r1 = analyzed[analyzed["Ticker"] == best["Ticker 1"]].iloc[0]
+                r2 = analyzed[analyzed["Ticker"] == best["Ticker 2"]].iloc[0]
+                legs_adv = [
+                    ("buy", "call", float(r1["Strike"]), float(first_valid_price(r1)), 1),
+                    ("buy", "put", float(r2["Strike"]), float(first_valid_price(r2)), 1),
+                ]
+
+            if legs_adv:
+                payoff_adv, net_cost_adv = strategy_payoff(legs_adv, prices_adv)
+                fig_adv = go.Figure()
+                fig_adv.add_trace(go.Scatter(x=prices_adv, y=payoff_adv, name="Payoff recomendación", mode="lines"))
+                fig_adv.add_hline(y=0, line_dash="dash")
+                fig_adv.add_vline(x=S, line_dash="dot", annotation_text="Precio actual")
+                fig_adv.update_layout(template="plotly_dark", height=460, xaxis_title="Precio al vencimiento", yaxis_title="Resultado", hovermode="x unified")
+                st.plotly_chart(fig_adv, use_container_width=True)
+
+            st.caption("Herramienta educativa. No constituye recomendación financiera personalizada.")
+
+
+with tabs[5]:
+    st.subheader("Payoff manual")
+    st.caption("Simulador manual de payoff. Para recomendaciones usá Advisor.")
 
     strategy_name = st.selectbox("Estrategia", list(STRATEGIES.keys()))
     st.info(STRATEGIES[strategy_name])
@@ -1338,10 +1702,14 @@ with tabs[4]:
     prices = np.linspace(S * 0.75, S * 1.25, 250)
     payoff, net_cost = strategy_payoff(legs, prices)
 
-    c1, c2, c3 = st.columns(3)
+    metrics = strategy_metrics(payoff, net_cost)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Costo neto aprox.", f"{net_cost:.2f}")
-    c2.metric("Ganancia máx. rango", f"{payoff.max():.2f}")
-    c3.metric("Pérdida máx. rango", f"{payoff.min():.2f}")
+    c2.metric("Ganancia", "Ilimitada*" if metrics["unlimited_upside"] else f"{metrics['max_gain']:.2f}")
+    c3.metric("Pérdida máx. rango", f"{metrics['max_loss']:.2f}")
+    c4.metric("% pérdida sobre capital", "" if pd.isna(metrics["loss_pct"]) else f"{metrics['loss_pct']:.1f}%")
+    if metrics["unlimited_upside"]:
+        st.caption("*Ilimitada teórica: el gráfico muestra solo el rango simulado.")
 
     signs = np.sign(payoff)
     breakevens = []
@@ -1365,7 +1733,7 @@ with tabs[4]:
     st.plotly_chart(figp, use_container_width=True)
 
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Velas")
     if st.button("🔁 Reset vista velas"):
         st.session_state["chart_revision"] = st.session_state.get("chart_revision", 0) + 1
@@ -1403,7 +1771,7 @@ with tabs[5]:
     )
     st.caption("Doble clic resetea. Toolbar: zoom, pan, autoscale y reset.")
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("Favoritos")
     favs = load_favorites()
     st.caption("Guardá tickers que querés seguir. Ejemplo: GFGC8600AG")
