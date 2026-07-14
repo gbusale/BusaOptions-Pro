@@ -92,8 +92,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.3")
-st.caption("IOL + Black-Scholes + Busa AI + Advisor cuantitativo + Learning bayesiano por clase.")
+st.title("BusaOptions Pro 9.6")
+st.caption("IOL + Black-Scholes + Busa AI + Advisor cuantitativo + Learning bayesiano + Análisis técnico profesional (RSI/MACD/Bollinger/Volumen/ADX).")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL"},
@@ -1150,6 +1150,478 @@ def market_status_text():
 
 
 # =========================
+# Indicadores técnicos clásicos (RSI, MACD, Bollinger)
+# =========================
+def compute_rsi(close, period=14):
+    """RSI de Wilder (suavizado exponencial), el estándar de la mayoría de las plataformas."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def compute_macd(close, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    return macd, signal_line, macd - signal_line
+
+def compute_bollinger(close, period=20, num_std=2):
+    sma = close.rolling(period).mean()
+    std = close.rolling(period).std()
+    return sma, sma + num_std * std, sma - num_std * std
+
+
+def compute_adx(high, low, close, period=14):
+    """
+    ADX(14) de Wilder + DI/-DI. A diferencia de RSI/MACD (que miden dirección
+    y momentum), el ADX mide la FUERZA de la tendencia -- clave para saber si
+    conviene confiar en las señales direccionales o si el papel está en un
+    rango sin tendencia real.
+    """
+    high = high.astype(float)
+    low = low.astype(float)
+    close = close.astype(float)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=high.index)
+
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1/period, adjust=False, min_periods=period).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1/period, adjust=False, min_periods=period).mean() / atr.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    return adx, plus_di, minus_di
+
+
+def rsi_expert_reading(rsi_series):
+    s = rsi_series.dropna()
+    if s.empty:
+        return "Sin datos suficientes para calcular RSI."
+    last = float(s.iloc[-1])
+    prev = float(s.iloc[-2]) if len(s) > 1 else last
+    if last >= 70:
+        zona = "sobrecompra"
+    elif last <= 30:
+        zona = "sobreventa"
+    elif last >= 50:
+        zona = "neutral-alcista"
+    else:
+        zona = "neutral-bajista"
+    direccion = "subiendo" if last > prev + 0.05 else "bajando" if last < prev - 0.05 else "estable"
+    return f"RSI(14) en {last:.1f} — zona {zona}, {direccion} respecto de la rueda anterior ({prev:.1f})."
+
+def macd_expert_reading(macd_series, signal_series, hist_series):
+    h = hist_series.dropna()
+    if h.empty:
+        return "Sin datos suficientes para calcular MACD."
+    m, s_val, hist = float(macd_series.iloc[-1]), float(signal_series.iloc[-1]), float(h.iloc[-1])
+    hist_prev = float(h.iloc[-2]) if len(h) > 1 else hist
+    estado = "por encima de la señal (sesgo comprador)" if m > s_val else "por debajo de la señal (sesgo vendedor)"
+    if abs(hist) > abs(hist_prev) + 0.01:
+        momentum = "el histograma se está expandiendo: el momentum actual se refuerza"
+    elif abs(hist) < abs(hist_prev) - 0.01:
+        momentum = "el histograma se está achicando: el momentum actual pierde fuerza, posible cruce cercano"
+    else:
+        momentum = "el histograma está estable"
+    return f"MACD {estado}; {momentum}."
+
+def bollinger_expert_reading(close_series, sma, upper, lower):
+    u = upper.dropna()
+    if u.empty:
+        return "Sin datos suficientes para calcular Bandas de Bollinger."
+    price = float(close_series.iloc[-1])
+    u_val, l_val, mid = float(upper.iloc[-1]), float(lower.iloc[-1]), float(sma.iloc[-1])
+    width_pct = (u_val - l_val) / mid * 100 if mid else np.nan
+    pos = (price - l_val) / (u_val - l_val) if (u_val - l_val) else np.nan
+    if pos >= 0.95:
+        zona = "tocando la banda superior (posible sobre-extensión de corto plazo)"
+    elif pos <= 0.05:
+        zona = "tocando la banda inferior (posible sobre-extensión bajista)"
+    else:
+        zona = f"al {pos*100:.0f}% del ancho de la banda (0=piso, 100=techo)"
+    if width_pct < 8:
+        compresion = "banda comprimida: la volatilidad está baja, atenti a una ruptura próxima"
+    elif width_pct > 20:
+        compresion = "banda expandida: volatilidad alta"
+    else:
+        compresion = "ancho de banda moderado"
+    return f"Precio {zona}. {compresion} ({width_pct:.1f}% del precio medio)."
+
+def trend_expert_reading(close_series, ema50):
+    e = ema50.dropna()
+    if e.empty:
+        return "Sin datos suficientes para evaluar la tendencia de fondo."
+    price = float(close_series.iloc[-1])
+    ema50_val = float(ema50.iloc[-1])
+    if price > ema50_val:
+        return f"Precio por encima de la EMA50 ({ema50_val:,.2f}) — estructura de tendencia alcista de mediano plazo."
+    return f"Precio por debajo de la EMA50 ({ema50_val:,.2f}) — estructura de tendencia bajista de mediano plazo."
+
+def volume_expert_reading(volume_series, close_series):
+    if volume_series is None or volume_series.dropna().empty:
+        return "Sin datos de volumen disponibles."
+    vol = volume_series.dropna()
+    if len(vol) < 21:
+        return "Historial de volumen insuficiente para comparar contra el promedio."
+    vol_avg20 = vol.rolling(20).mean()
+    vol_last = float(vol.iloc[-1])
+    vol_avg_last = float(vol_avg20.iloc[-1])
+    if not vol_avg_last:
+        return "No pude comparar el volumen contra su promedio."
+    ratio = vol_last / vol_avg_last
+    price_change = float(close_series.iloc[-1]) - float(close_series.iloc[-2])
+    nivel = "muy por encima" if ratio >= 1.5 else "por encima" if ratio >= 1.2 else "por debajo" if ratio <= 0.8 else "en línea con"
+    direccion = "suba" if price_change > 0 else "baja" if price_change < 0 else "sin cambio"
+    confirma = ""
+    if ratio >= 1.2 and price_change != 0:
+        confirma = " El volumen elevado le da más peso a este movimiento: hay convicción real detrás del precio."
+    elif ratio <= 0.8:
+        confirma = " Volumen flojo: el movimiento reciente podría no tener demasiada convicción detrás todavía."
+    return f"Volumen {nivel} su promedio de 20 ruedas (ratio {ratio:.2f}x), en una rueda de {direccion}.{confirma}"
+
+def adx_expert_reading(adx, plus_di, minus_di):
+    a = adx.dropna()
+    if a.empty:
+        return "Sin datos suficientes para calcular ADX."
+    adx_val = float(a.iloc[-1])
+    pdi, mdi = float(plus_di.iloc[-1]), float(minus_di.iloc[-1])
+    if adx_val >= 40:
+        fuerza = "tendencia muy fuerte"
+    elif adx_val >= 25:
+        fuerza = "tendencia con fuerza real"
+    elif adx_val >= 20:
+        fuerza = "tendencia incipiente, todavía débil"
+    else:
+        fuerza = "sin tendencia definida: mercado lateral/en rango"
+    direccion = "alcista (+DI por encima de -DI)" if pdi > mdi else "bajista (-DI por encima de +DI)"
+    return f"ADX(14) en {adx_val:.1f}: {fuerza}. Dirección dominante {direccion} (+DI {pdi:.1f} / -DI {mdi:.1f})."
+
+
+def technical_verdict(rsi, macd, macd_signal, close_series, sma20, ema50, volume_series, adx, plus_di, minus_di):
+    """
+    Veredicto técnico consolidado (Sube/Baja/Lateral): una votación simple y
+    transparente entre RSI, MACD, posición vs. el centro de Bollinger y
+    tendencia (EMA50), con el volumen como confirmación (medio voto, no voto
+    completo, porque el volumen no tiene dirección propia). El ADX no vota:
+    modula qué tanta confianza darle al veredicto (si no hay tendencia real,
+    el veredicto direccional vale menos).
+
+    Es independiente del pronóstico estadístico de Busa AI (que usa un modelo
+    lognormal con aprendizaje bayesiano) -- pueden coincidir o no.
+    """
+    score = 0.0
+    detalle = []
+
+    rsi_s = rsi.dropna()
+    if not rsi_s.empty:
+        rsi_last = float(rsi_s.iloc[-1])
+        if rsi_last > 55:
+            score += 1; detalle.append(("RSI", "alcista"))
+        elif rsi_last < 45:
+            score -= 1; detalle.append(("RSI", "bajista"))
+        else:
+            detalle.append(("RSI", "neutral"))
+
+    macd_s = macd.dropna()
+    if not macd_s.empty:
+        if float(macd.iloc[-1]) > float(macd_signal.iloc[-1]):
+            score += 1; detalle.append(("MACD", "alcista"))
+        else:
+            score -= 1; detalle.append(("MACD", "bajista"))
+
+    sma_s = sma20.dropna()
+    if not sma_s.empty:
+        price = float(close_series.iloc[-1])
+        if price > float(sma20.iloc[-1]):
+            score += 1; detalle.append(("Bollinger (vs. centro)", "alcista"))
+        else:
+            score -= 1; detalle.append(("Bollinger (vs. centro)", "bajista"))
+
+    ema_s = ema50.dropna()
+    if not ema_s.empty:
+        price = float(close_series.iloc[-1])
+        if price > float(ema50.iloc[-1]):
+            score += 1; detalle.append(("Tendencia (EMA50)", "alcista"))
+        else:
+            score -= 1; detalle.append(("Tendencia (EMA50)", "bajista"))
+
+    if volume_series is not None and len(volume_series.dropna()) > 20:
+        vol_avg20 = volume_series.rolling(20).mean()
+        vol_last = float(volume_series.iloc[-1])
+        vol_avg_last = float(vol_avg20.iloc[-1])
+        price_change = float(close_series.iloc[-1]) - float(close_series.iloc[-2])
+        if vol_avg_last and vol_last > vol_avg_last * 1.2:
+            if price_change > 0:
+                score += 0.5; detalle.append(("Volumen", "confirma alcista"))
+            elif price_change < 0:
+                score -= 0.5; detalle.append(("Volumen", "confirma bajista"))
+
+    adx_s = adx.dropna()
+    adx_last = float(adx_s.iloc[-1]) if not adx_s.empty else None
+    tendencia_fuerte = adx_last is not None and adx_last >= 25
+
+    if score >= 1.5:
+        veredicto = "SUBE"
+    elif score <= -1.5:
+        veredicto = "BAJA"
+    else:
+        veredicto = "LATERAL"
+
+    return veredicto, score, detalle, adx_last, tendencia_fuerte
+
+
+# =========================
+# Gráficos individuales (uno por indicador, cada uno con su propia lectura)
+# =========================
+TA_THEME = {
+    "up": "#26a69a",
+    "down": "#ef5350",
+    "price": "#e5e7eb",
+    "ema20": "#f0b90b",
+    "ema50": "#3b82f6",
+    "band": "#8b95a5",
+    "band_fill": "rgba(139,149,165,0.08)",
+    "rsi": "#c084fc",
+    "macd": "#3b82f6",
+    "signal": "#f0b90b",
+    "adx": "#f0b90b",
+    "plus_di": "#26a69a",
+    "minus_di": "#ef5350",
+    "vol_avg": "#f0b90b",
+    "grid": "rgba(255,255,255,0.055)",
+    "zeroline": "rgba(255,255,255,0.15)",
+    "text": "#cbd5e1",
+    "title": "#f1f5f9",
+}
+
+def _style_axes(fig, yaxis_title=None):
+    fig.update_xaxes(showgrid=True, gridcolor=TA_THEME["grid"], zeroline=False, showline=True, linecolor=TA_THEME["grid"])
+    fig.update_yaxes(showgrid=True, gridcolor=TA_THEME["grid"], zeroline=False, showline=True, linecolor=TA_THEME["grid"], title_text=yaxis_title, title_font=dict(size=11, color=TA_THEME["text"]))
+    return fig
+
+def _finalize_layout(fig, height, title, yaxis_title=None, show_legend=True):
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Segoe UI, Roboto, Arial, sans-serif", size=12, color=TA_THEME["text"]),
+        title=dict(text=title, font=dict(size=14, color=TA_THEME["title"]), x=0.01, xanchor="left", y=0.97),
+        height=height,
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="#1f2937", font_size=12, font_family="Segoe UI, Arial, sans-serif", bordercolor="rgba(255,255,255,0.1)"),
+        showlegend=show_legend,
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.005, x=0,
+            bgcolor="rgba(15,23,42,0.55)", bordercolor="rgba(255,255,255,0.08)", borderwidth=1,
+            font=dict(size=11),
+        ),
+        margin=dict(l=10, r=55, t=42, b=25),
+    )
+    return _style_axes(fig, yaxis_title)
+
+def _last_value_line(fig, x_last, y_last, color, fmt="{:,.2f}"):
+    fig.add_hline(
+        y=y_last, line_dash="dot", line_width=1, line_color="rgba(255,255,255,0.35)",
+        annotation_text=fmt.format(y_last), annotation_position="right",
+        annotation_font=dict(size=11, color=color), annotation_bgcolor="rgba(15,23,42,0.75)",
+    )
+    return fig
+
+
+def build_price_figure(hist, sma20, bb_up, bb_dn, ema20, ema50, ticker_key="", lookback_days=180):
+    idx = hist.index[-lookback_days:] if len(hist) > lookback_days else hist.index
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=idx, y=bb_up.loc[idx], name="Banda sup. (20,2)",
+        line=dict(color=TA_THEME["band"], width=1, dash="dot"),
+        hovertemplate="Banda sup.: %{y:,.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=idx, y=bb_dn.loc[idx], name="Banda inf. (20,2)",
+        line=dict(color=TA_THEME["band"], width=1, dash="dot"),
+        fill="tonexty", fillcolor=TA_THEME["band_fill"],
+        hovertemplate="Banda inf.: %{y:,.2f}<extra></extra>",
+    ))
+    fig.add_trace(go.Candlestick(
+        x=idx, open=hist.loc[idx, "Open"], high=hist.loc[idx, "High"],
+        low=hist.loc[idx, "Low"], close=hist.loc[idx, "Close"],
+        name="Precio",
+        increasing=dict(line=dict(color=TA_THEME["up"]), fillcolor=TA_THEME["up"]),
+        decreasing=dict(line=dict(color=TA_THEME["down"]), fillcolor=TA_THEME["down"]),
+    ))
+    fig.add_trace(go.Scatter(x=idx, y=ema20.loc[idx], name="EMA20", line=dict(color=TA_THEME["ema20"], width=1.5),
+                              hovertemplate="EMA20: %{y:,.2f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=idx, y=ema50.loc[idx], name="EMA50", line=dict(color=TA_THEME["ema50"], width=1.5),
+                              hovertemplate="EMA50: %{y:,.2f}<extra></extra>"))
+
+    last_price = float(hist.loc[idx, "Close"].iloc[-1])
+    _last_value_line(fig, idx[-1], last_price, TA_THEME["price"])
+
+    fig.update_layout(xaxis_rangeslider_visible=False)
+    fig.update_yaxes(tickformat=",.0f")
+    return _finalize_layout(fig, 460, f"Precio, Bollinger(20,2) y EMAs — {ticker_key}", "Precio (ARS)")
+
+def build_volume_figure(hist, ticker_key="", lookback_days=180):
+    idx = hist.index[-lookback_days:] if len(hist) > lookback_days else hist.index
+    vol = hist.loc[idx, "Volume"]
+    colors = [TA_THEME["up"] if c >= o else TA_THEME["down"] for c, o in zip(hist.loc[idx, "Close"], hist.loc[idx, "Open"])]
+    vol_avg = hist["Volume"].rolling(20).mean().loc[idx]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=idx, y=vol, marker_color=colors, opacity=0.75, name="Volumen",
+                          hovertemplate="Volumen: %{y:,.0f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=idx, y=vol_avg, name="Promedio 20 ruedas", line=dict(color=TA_THEME["vol_avg"], width=1.6),
+                              hovertemplate="Promedio 20r: %{y:,.0f}<extra></extra>"))
+    fig.update_yaxes(tickformat=",.0f")
+    return _finalize_layout(fig, 260, f"Volumen — {ticker_key}", "Volumen (nominales)")
+
+def build_rsi_figure(rsi, ticker_key="", lookback_days=180):
+    idx = rsi.index[-lookback_days:] if len(rsi) > lookback_days else rsi.index
+    fig = go.Figure()
+    fig.add_hrect(y0=70, y1=100, fillcolor=TA_THEME["down"], opacity=0.06, line_width=0)
+    fig.add_hrect(y0=0, y1=30, fillcolor=TA_THEME["up"], opacity=0.06, line_width=0)
+    fig.add_trace(go.Scatter(x=idx, y=rsi.loc[idx], name="RSI(14)", line=dict(color=TA_THEME["rsi"], width=2),
+                              hovertemplate="RSI: %{y:.1f}<extra></extra>"))
+    fig.add_hline(y=70, line_dash="dash", line_width=1, line_color=TA_THEME["down"], annotation_text="Sobrecompra 70", annotation_font=dict(size=10, color=TA_THEME["down"]))
+    fig.add_hline(y=30, line_dash="dash", line_width=1, line_color=TA_THEME["up"], annotation_text="Sobreventa 30", annotation_font=dict(size=10, color=TA_THEME["up"]))
+    fig.add_hline(y=50, line_dash="dot", line_width=1, line_color=TA_THEME["zeroline"])
+    last_rsi = float(rsi.loc[idx].dropna().iloc[-1]) if not rsi.loc[idx].dropna().empty else None
+    if last_rsi is not None:
+        _last_value_line(fig, idx[-1], last_rsi, TA_THEME["rsi"], fmt="{:.1f}")
+    fig.update_yaxes(range=[0, 100])
+    return _finalize_layout(fig, 260, f"RSI(14) — {ticker_key}", "RSI", show_legend=False)
+
+def build_macd_figure(macd, macd_signal, macd_hist, ticker_key="", lookback_days=180):
+    idx = macd.index[-lookback_days:] if len(macd) > lookback_days else macd.index
+    hist_vals = macd_hist.loc[idx]
+    colors = [TA_THEME["up"] if v >= 0 else TA_THEME["down"] for v in hist_vals]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=idx, y=hist_vals, name="Histograma", marker_color=colors, opacity=0.6,
+                          hovertemplate="Histograma: %{y:,.2f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=idx, y=macd.loc[idx], name="MACD", line=dict(color=TA_THEME["macd"], width=2),
+                              hovertemplate="MACD: %{y:,.2f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=idx, y=macd_signal.loc[idx], name="Señal", line=dict(color=TA_THEME["signal"], width=1.5),
+                              hovertemplate="Señal: %{y:,.2f}<extra></extra>"))
+    fig.add_hline(y=0, line_width=1, line_color=TA_THEME["zeroline"])
+    return _finalize_layout(fig, 300, f"MACD(12,26,9) — {ticker_key}", "MACD")
+
+def build_adx_figure(adx, plus_di, minus_di, ticker_key="", lookback_days=180):
+    idx = adx.index[-lookback_days:] if len(adx) > lookback_days else adx.index
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=idx, y=adx.loc[idx], name="ADX(14)", line=dict(color=TA_THEME["adx"], width=2.2),
+                              hovertemplate="ADX: %{y:.1f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=idx, y=plus_di.loc[idx], name="+DI", line=dict(color=TA_THEME["plus_di"], width=1.3),
+                              hovertemplate="+DI: %{y:.1f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=idx, y=minus_di.loc[idx], name="-DI", line=dict(color=TA_THEME["minus_di"], width=1.3),
+                              hovertemplate="-DI: %{y:.1f}<extra></extra>"))
+    fig.add_hline(y=25, line_dash="dash", line_width=1, line_color=TA_THEME["band"], annotation_text="Umbral de tendencia (25)", annotation_font=dict(size=10, color=TA_THEME["band"]))
+    return _finalize_layout(fig, 280, f"ADX(14) — Fuerza de tendencia — {ticker_key}", "ADX / DI")
+
+
+def render_technical_panel(ticker_key, activo_seleccionado, period, horizon, lateral, lookback,
+                            drift_shrink, use_tilt, tilt_strength, learning_window, learning_prior_strength):
+    """
+    Panel completo estilo 'experto en análisis técnico' para un ticker:
+    pronóstico Busa AI (Sube/Baja/Lateral) + veredicto técnico consolidado +
+    un gráfico independiente por indicador (precio/Bollinger/EMAs, volumen,
+    RSI, MACD, ADX), cada uno con su propia lectura. Se usa una vez por cada
+    activo (GGAL e YPF), independiente de cuál esté elegido en la barra lateral.
+    """
+    hist = get_hist(TICKERS[ticker_key]["local"], period)
+    if hist.empty:
+        st.warning(f"No pude descargar histórico de {ticker_key}.")
+        return
+
+    close_series = hist["Close"].dropna()
+    volume_series = hist["Volume"] if "Volume" in hist.columns else None
+    S_local = float(close_series.iloc[-1])
+    fuente_precio = "yfinance"
+    if ticker_key == activo_seleccionado and "spot_iol" in st.session_state:
+        S_local = float(st.session_state["spot_iol"])
+        fuente_precio = "IOL"
+
+    prob_local = prob_data(hist, int(horizon), lateral, int(lookback), drift_shrink, use_tilt, tilt_strength)
+    prob_local = apply_learning_to_probabilities(prob_local, ticker_key, int(learning_window), int(learning_prior_strength))
+
+    rsi = compute_rsi(close_series)
+    macd, macd_signal, macd_hist = compute_macd(close_series)
+    sma20, bb_up, bb_dn = compute_bollinger(close_series)
+    ema20 = close_series.ewm(span=20, adjust=False).mean()
+    ema50 = close_series.ewm(span=50, adjust=False).mean()
+    adx, plus_di, minus_di = compute_adx(hist["High"], hist["Low"], close_series)
+
+    # --- Pronóstico Busa AI (modelo estadístico) ---
+    with st.container(border=True):
+        st.markdown(f"##### Pronóstico Busa AI — {ticker_key}")
+        prob_bar("Sube", prob_local["Sube"], "#15803d")
+        prob_bar("Baja", prob_local["Baja"], "#b91c1c")
+        prob_bar("Lateral", prob_local["Lateral"], "#ca8a04")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Precio", f"{S_local:,.2f}")
+        c2.metric("Nivel suba", f"{prob_local['Nivel suba']:,.2f}")
+        c3.metric("Nivel baja", f"{prob_local['Nivel baja']:,.2f}")
+        generado = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        ultimo_dato = pd.to_datetime(close_series.index[-1]).strftime("%d/%m/%Y")
+        st.caption(f"🕒 Predicción generada: {generado} hs. | Datos de precio hasta: {ultimo_dato} | Fuente del precio: {fuente_precio} | Horizonte: {int(horizon)} ruedas.")
+
+    # --- Veredicto técnico consolidado ---
+    veredicto, score, detalle, adx_last, tendencia_fuerte = technical_verdict(
+        rsi, macd, macd_signal, close_series, sma20, ema50, volume_series, adx, plus_di, minus_di
+    )
+    css_class = "score-good" if veredicto == "SUBE" else "score-bad" if veredicto == "BAJA" else "score-mid"
+    icono = "▲" if veredicto == "SUBE" else "▼" if veredicto == "BAJA" else "➡"
+    with st.container(border=True):
+        st.markdown(f"##### Veredicto técnico — {ticker_key}")
+        st.markdown(f'<span class="{css_class}" style="font-size:26px;">{icono} {veredicto}</span>', unsafe_allow_html=True)
+        detalle_txt = " · ".join([f"{k}: {v}" for k, v in detalle])
+        st.caption(f"Puntaje: {score:+.1f} (rango -4.5 a +4.5) — {detalle_txt}")
+        if adx_last is not None:
+            conf_txt = "tendencia confirmada (ADX ≥ 25): el veredicto tiene más respaldo" if tendencia_fuerte else "sin tendencia fuerte todavía (ADX < 25): tomar el veredicto con más cautela, el mercado puede estar en rango"
+            st.caption(f"Fuerza de tendencia (ADX): {adx_last:.1f} — {conf_txt}.")
+        st.caption("Veredicto técnico (RSI + MACD + Bollinger + tendencia + volumen). Es independiente del pronóstico estadístico Busa AI de arriba: pueden coincidir o no.")
+
+    # --- Gráfico 1: Precio + Bollinger + EMAs ---
+    with st.container(border=True):
+        st.write(f"📉 {bollinger_expert_reading(close_series, sma20, bb_up, bb_dn)}")
+        st.write(f"📐 {trend_expert_reading(close_series, ema50)}")
+        st.plotly_chart(build_price_figure(hist, sma20, bb_up, bb_dn, ema20, ema50, ticker_key), use_container_width=True, config={"displaylogo": False})
+
+    # --- Gráfico 2: Volumen ---
+    with st.container(border=True):
+        st.write(f"📦 {volume_expert_reading(volume_series, close_series)}")
+        st.plotly_chart(build_volume_figure(hist, ticker_key), use_container_width=True, config={"displaylogo": False})
+
+    # --- Gráfico 3: RSI ---
+    with st.container(border=True):
+        st.write(f"📈 {rsi_expert_reading(rsi)}")
+        st.plotly_chart(build_rsi_figure(rsi, ticker_key), use_container_width=True, config={"displaylogo": False})
+
+    # --- Gráfico 4: MACD ---
+    with st.container(border=True):
+        st.write(f"📊 {macd_expert_reading(macd, macd_signal, macd_hist)}")
+        st.plotly_chart(build_macd_figure(macd, macd_signal, macd_hist, ticker_key), use_container_width=True, config={"displaylogo": False})
+
+    # --- Gráfico 5: ADX (fuerza de tendencia) ---
+    with st.container(border=True):
+        st.write(f"🧭 {adx_expert_reading(adx, plus_di, minus_di)}")
+        st.plotly_chart(build_adx_figure(adx, plus_di, minus_di, ticker_key), use_container_width=True, config={"displaylogo": False})
+
+    st.caption("Análisis técnico educativo (RSI, MACD, Bollinger, EMAs, Volumen, ADX). No constituye recomendación financiera personalizada.")
+
+
+# =========================
 # Estrategias
 # =========================
 STRATEGIES = {
@@ -1724,14 +2196,16 @@ with tabs[1]:
         st.dataframe(fmt(view[view["Tipo"] == "PUT"].sort_values("Strike")), use_container_width=True)
 
 with tabs[2]:
-    st.subheader("Probabilidades")
-    prob_bar("Sube", prob["Sube"], "#15803d")
-    prob_bar("Baja", prob["Baja"], "#b91c1c")
-    prob_bar("Lateral", prob["Lateral"], "#ca8a04")
-    c1, c2 = st.columns(2)
-    c1.metric("Nivel suba", f"{prob['Nivel suba']:,.2f}")
-    c2.metric("Nivel baja", f"{prob['Nivel baja']:,.2f}")
-    st.metric("Precio base", f"{S:,.2f}")
+    st.subheader("Probabilidades y Análisis Técnico")
+    st.caption("Pronóstico Busa AI (modelo estadístico + Learning) y análisis técnico clásico — RSI, MACD, Bandas de Bollinger y EMAs — para GGAL e YPF en BYMA.")
+
+    ticker_tabs = st.tabs(["GGAL", "YPF"])
+    with ticker_tabs[0]:
+        render_technical_panel("GGAL", activo, period, horizon, lateral, lookback,
+                                drift_shrink, use_tilt, tilt_strength, learning_window, learning_prior_strength)
+    with ticker_tabs[1]:
+        render_technical_panel("YPF", activo, period, horizon, lateral, lookback,
+                                drift_shrink, use_tilt, tilt_strength, learning_window, learning_prior_strength)
 
 
 with tabs[3]:
@@ -1749,6 +2223,9 @@ with tabs[3]:
     c2.metric("Predicción", pred)
     c3.metric("Confianza", confidence)
     c4.metric("Estrategia sugerida", strategy)
+    generado_ai = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    ultimo_dato_ai = pd.to_datetime(close.index[-1]).strftime("%d/%m/%Y")
+    st.caption(f"🕒 Predicción generada: {generado_ai} hs. | Datos de precio hasta: {ultimo_dato_ai}")
 
     st.markdown("### Probabilidades")
     p1, p2, p3 = st.columns(3)
