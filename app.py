@@ -2,6 +2,7 @@
 import json
 import hmac
 import re
+import calendar
 from pathlib import Path
 from datetime import datetime, time
 import streamlit as st
@@ -98,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.9")
-st.caption("IOL + Black-Scholes + Busa AI + Advisor cuantitativo + Learning bayesiano + Análisis técnico + Cartera IOL + segunda fuente BYMA.")
+st.title("BusaOptions Pro 9.12")
+st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL con análisis completo + segunda fuente BYMA.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL"},
@@ -1097,6 +1098,62 @@ def infer_tipo(symbol):
     s = str(symbol).upper()
     return "put" if ("GFGV" in s or "YPFV" in s or s.endswith("V")) else "call"
 
+
+# =========================
+# Vencimiento automático por ticker (BYMA: tercer viernes del mes)
+# =========================
+# Código de mes = últimas 2 letras del ticker de la opción (ej. "AG" en
+# GFGC8600AG = Agosto). Confirmados contra fuentes públicas de BYMA/brokers:
+# FE=Febrero, MY=Mayo, JU=Junio, AG=Agosto, DI=Diciembre. El resto (EN, MA,
+# AB, JL, SE, OC, NO) se completó por el mismo patrón de no-colisión que
+# usan los confirmados (ej. Mayo="MY" en vez de "MA" para no chocar con
+# Marzo; Junio="JU" en vez de Julio para no chocar con Julio="JL").
+# Si algún código no coincide en la práctica, se corrige acá en un solo lugar.
+MESES_OPCIONES = {
+    "EN": 1, "FE": 2, "MA": 3, "AB": 4, "MY": 5, "JU": 6,
+    "JL": 7, "AG": 8, "SE": 9, "OC": 10, "NO": 11, "DI": 12,
+}
+
+def third_friday(year, month):
+    """Tercer viernes del mes/año dado (regla de vencimiento de opciones BYMA)."""
+    cal = calendar.Calendar(firstweekday=0)
+    fridays = [d for d in cal.itermonthdates(year, month) if d.month == month and d.weekday() == 4]
+    return fridays[2]
+
+def parse_option_expiry(ticker, hoy=None):
+    """
+    Infiere la fecha de vencimiento de una opción de BYMA a partir del código
+    de mes en las últimas 2 letras del ticker + la regla del tercer viernes.
+
+    Devuelve (fecha, dias, fuente):
+    - fecha: date del vencimiento, o None si no se pudo inferir.
+    - dias: días corridos hasta el vencimiento (>=0), o None.
+    - fuente: "ticker" si se pudo inferir, "desconocido" si no (quien llama
+      debe usar en ese caso el valor manual de 'Días vencimiento' como
+      respaldo).
+
+    Nota: BYMA corre el vencimiento al hábil inmediato anterior si el tercer
+    viernes cae feriado. Ese ajuste no se aplica acá (no tengo un calendario
+    de feriados bursátiles argentinos confiable a mano), así que en esos
+    casos puntuales la fecha real puede ser 1 día hábil antes de la
+    calculada.
+    """
+    if hoy is None:
+        hoy = datetime.now().date()
+    m = re.search(r"([A-Z]{2})$", str(ticker).upper())
+    if not m or m.group(1) not in MESES_OPCIONES:
+        return None, None, "desconocido"
+
+    mes = MESES_OPCIONES[m.group(1)]
+    anio = hoy.year
+    fecha = third_friday(anio, mes)
+    if fecha < hoy:
+        anio += 1
+        fecha = third_friday(anio, mes)
+
+    dias = (fecha - hoy).days
+    return fecha, dias, "ticker"
+
 def normalize_options(raw):
     if isinstance(raw, dict):
         for key in ["opciones", "titulos", "data", "result", "items"]:
@@ -1220,7 +1277,33 @@ def underlying_for_option(ticker):
     return None
 
 
-def recommend_option_action(typ, cantidad, dias_venc, extrinsic, prima_actual, ppc, prob_dict, veredicto_tecnico):
+def position_expected_value(typ, K, cantidad, prima_actual, S, T, mu, hv):
+    """
+    Compara, para una posición ya abierta:
+    - Valor de cerrarla ahora al precio de mercado actual (prima_actual * cantidad).
+    - Valor esperado de mantenerla hasta el vencimiento, integrando el payoff
+      bruto (sin descontar lo ya pagado, que es costo hundido) contra la
+      misma distribución lognormal que usa el resto de la app (Advisor,
+      Probabilidades). No es una garantía, es una comparación bajo el
+      pronóstico vigente.
+    """
+    if K is None or np.isnan(K) or cantidad is None or np.isnan(cantidad) or T is None or T <= 0 or hv is None or np.isnan(hv) or hv <= 0:
+        return np.nan, np.nan
+    prices = np.linspace(max(S * 0.4, 1), S * 2.0, 400)
+    payoff_bruto = np.maximum(prices - K, 0) if typ == "call" else np.maximum(K - prices, 0)
+    weights = lognormal_weights(prices, S, T, mu, hv)
+    area = _trapz(weights, prices)
+    if area <= 0:
+        return np.nan, np.nan
+    weights_norm = weights / area
+    valor_unitario = _trapz(weights_norm * payoff_bruto, prices)
+    valor_esperado_mantener = float(valor_unitario * cantidad)
+    valor_cierre_ahora = float(prima_actual * cantidad) if prima_actual is not None and not np.isnan(prima_actual) else np.nan
+    return valor_esperado_mantener, valor_cierre_ahora
+
+
+def recommend_option_action(typ, cantidad, dias_venc, extrinsic, prima_actual, ppc, prob_dict, veredicto_tecnico,
+                             valor_esperado_mantener=None, valor_cierre_ahora=None, liquidez=None):
     """
     Recomendación simple y transparente (MANTENER / VIGILAR / VENDER) para una
     posición de opciones en cartera. Combina:
@@ -1230,6 +1313,10 @@ def recommend_option_action(typ, cantidad, dias_venc, extrinsic, prima_actual, p
     - Cuánto tiempo queda al vencimiento.
     - Cuánto valor extrínseco le queda (si ya no tiene casi nada, poco
       sentido tiene esperar más).
+    - Valor esperado de mantener hasta el vencimiento vs. cerrar ahora
+      (integrando contra el mismo modelo lognormal que usa el Advisor).
+    - Liquidez de esta opción puntual (no del papel): si es muy baja, cuesta
+      más salir a buen precio.
 
     No es asesoramiento financiero personalizado: es una lectura basada en
     reglas explícitas, pensada para acompañar la decisión, no reemplazarla.
@@ -1279,6 +1366,23 @@ def recommend_option_action(typ, cantidad, dias_venc, extrinsic, prima_actual, p
             score -= 0.5
             razones.append("Casi no le queda valor extrínseco: ya se movió casi todo lo que tenía para moverse por prima de tiempo.")
 
+    if valor_esperado_mantener is not None and valor_cierre_ahora is not None and not np.isnan(valor_esperado_mantener) and not np.isnan(valor_cierre_ahora):
+        base = abs(valor_cierre_ahora) if valor_cierre_ahora != 0 else abs(valor_esperado_mantener)
+        if base > 0:
+            diff_pct = (valor_esperado_mantener - valor_cierre_ahora) / base * 100
+            if diff_pct > 8:
+                score += 1
+                razones.append(f"El valor esperado de mantener hasta el vencimiento ({valor_esperado_mantener:,.0f}) supera al de cerrar ahora ({valor_cierre_ahora:,.0f}), según el pronóstico vigente.")
+            elif diff_pct < -8:
+                score -= 1
+                razones.append(f"Cerrar ahora ({valor_cierre_ahora:,.0f}) rinde más que el valor esperado de mantener ({valor_esperado_mantener:,.0f}), según el pronóstico vigente.")
+            else:
+                razones.append("El valor esperado de mantener y el de cerrar ahora son similares.")
+
+    if liquidez is not None and not np.isnan(liquidez) and liquidez < 35:
+        score -= 0.25
+        razones.append(f"Liquidez baja en esta opción puntual ({liquidez:.0f}/100): podría costar salir a buen precio.")
+
     pnl_pct = np.nan
     if ppc is not None and not np.isnan(ppc) and ppc > 0 and prima_actual is not None and not np.isnan(prima_actual):
         pnl_pct = (prima_actual - ppc) / ppc * 100
@@ -1298,6 +1402,7 @@ def recommend_option_action(typ, cantidad, dias_venc, extrinsic, prima_actual, p
 def analyze(df, S, T, r, hv, p_up, p_down, mode):
     rows = []
     favorites = set(load_favorites())
+    hoy = datetime.now().date()
     for _, row in df.iterrows():
         typ = str(row.get("Tipo", "call")).lower()
         K = clean_num(row.get("Strike"))
@@ -1313,10 +1418,20 @@ def analyze(df, S, T, r, hv, p_up, p_down, mode):
         else:
             prima = ultimo if not np.isnan(ultimo) else np.nanmean([compra, venta])
 
-        theo = bs_price(S, K, T, r, hv, typ)
-        iv = implied_vol(prima, S, K, T, r, typ) if not np.isnan(prima) else np.nan
+        # Vencimiento automático por ticker (tercer viernes del mes que indican
+        # las últimas 2 letras). Si no se puede inferir, cae al valor manual
+        # de 'Días vencimiento' de la barra lateral (T ya viene calculado con eso).
+        fecha_venc, dias_venc, fuente_venc = parse_option_expiry(row.get("Ticker"), hoy)
+        if fecha_venc is not None:
+            T_row = max(dias_venc, 0) / 365
+        else:
+            T_row = T
+            dias_venc = int(round(T * 365))
+
+        theo = bs_price(S, K, T_row, r, hv, typ)
+        iv = implied_vol(prima, S, K, T_row, r, typ) if not np.isnan(prima) else np.nan
         sig = iv if not np.isnan(iv) else hv
-        delta, gamma, vega, theta, rho, prob_itm = greeks(S, K, T, r, sig, typ)
+        delta, gamma, vega, theta, rho, prob_itm = greeks(S, K, T_row, r, sig, typ)
         intrinsic = max(S-K, 0) if typ == "call" else max(K-S, 0)
         extrinsic = prima - intrinsic if not np.isnan(prima) else np.nan
         diff = ((prima/theo)-1)*100 if not np.isnan(prima) and theo and theo > 0 else np.nan
@@ -1349,6 +1464,9 @@ def analyze(df, S, T, r, hv, p_up, p_down, mode):
             "Vol. Compra": clean_num(row.get("Vol. Compra")),
             "Vol. Venta": clean_num(row.get("Vol. Venta")),
             "Último": ultimo,
+            "Vencimiento": fecha_venc.strftime("%d/%m/%Y") if fecha_venc is not None else "",
+            "Días venc.": dias_venc,
+            "Fuente venc.": "Ticker (3er viernes)" if fuente_venc == "ticker" else "Manual (barra lateral)",
             "Prima usada": prima,
             "Black-Scholes": theo,
             "Dif % vs BS": diff,
@@ -1371,7 +1489,7 @@ def analyze(df, S, T, r, hv, p_up, p_down, mode):
 
 def fmt(df):
     fmt_map = {c: "{:.2f}" for c in df.columns if pd.api.types.is_numeric_dtype(df[c])}
-    for c in ["Strike", "Score Busa", "Volumen", "Vol. Compra", "Vol. Venta"]:
+    for c in ["Strike", "Score Busa", "Volumen", "Vol. Compra", "Vol. Venta", "Días venc."]:
         if c in fmt_map:
             fmt_map[c] = "{:.0f}"
     if "Delta" in fmt_map:
@@ -2041,11 +2159,29 @@ def build_strategy_advisor(analyzed, S, prob_dict, T_expiry, mu, hv, max_loss_pc
     calls = df[df["Tipo"] == "CALL"].sort_values("Strike")
     puts = df[df["Tipo"] == "PUT"].sort_values("Strike")
 
-    def add_row(strategy, t1, t2, t3, t4, escenario, ganancia, legs, breakeven, score_base, comment):
+    def _row_T(row, fallback_T):
+        d = clean_num(row.get("Días venc."))
+        if not np.isnan(d) and d > 0:
+            return d / 365
+        return fallback_T
+
+    def add_row(strategy, t1, t2, t3, t4, escenario, ganancia, legs, breakeven, score_base, comment, T_leg=None, venc_str=""):
+        T_use = T_leg if T_leg is not None else T_expiry
         payoff, net_cost = strategy_payoff(legs, prices)
         m = strategy_metrics(payoff, net_cost)
-        prob_profit, ev = strategy_probability_and_ev(payoff, prices, S, T_expiry, mu, hv)
+        prob_profit, ev = strategy_probability_and_ev(payoff, prices, S, T_use, mu, hv)
         liquidity = liquidity_score_for_legs([t1, t2, t3, t4], analyzed)
+
+        # Acción (Compra/Venta) de cada pata, en el mismo orden que Ticker 1-4.
+        # Se arma directamente desde 'legs' (la verdad de la estrategia), no
+        # se infiere del nombre -- así no puede quedar desincronizado.
+        accion_map = {"buy": "Compra", "sell": "Venta"}
+        tickers_row = [t1, t2, t3, t4]
+        acciones_partes = []
+        for i, leg in enumerate(legs):
+            if i < len(tickers_row) and tickers_row[i]:
+                acciones_partes.append(f"T{i+1}: {accion_map.get(leg[0], leg[0])}")
+        acciones_str = " · ".join(acciones_partes)
 
         ev_component = 0.0
         if net_cost:
@@ -2073,6 +2209,9 @@ def build_strategy_advisor(analyzed, S, prob_dict, T_expiry, mu, hv, max_loss_pc
             "Ticker 2": t2,
             "Ticker 3": t3,
             "Ticker 4": t4,
+            "Acción por pata": acciones_str,
+            "Vencimiento": venc_str,
+            "Días venc.": int(round(T_use * 365)),
             "Escenario": escenario,
             "Ganancia": ganancia,
             "Costo neto": net_cost,
@@ -2095,7 +2234,7 @@ def build_strategy_advisor(analyzed, S, prob_dict, T_expiry, mu, hv, max_loss_pc
             K = float(c["Strike"]); p = float(c["prima_ref"])
             legs = [("buy", "call", K, p, 1)]
             breakeven = K + p
-            add_row("Call comprado", c["Ticker"], "", "", "", "Alcista fuerte", "Ilimitada teórica", legs, breakeven, float(c["Score Busa"]), "Mayor potencial alcista. Riesgo limitado a prima.")
+            add_row("Call comprado", c["Ticker"], "", "", "", "Alcista fuerte", "Ilimitada teórica", legs, breakeven, float(c["Score Busa"]), "Mayor potencial alcista. Riesgo limitado a prima.", T_leg=_row_T(c, T_expiry), venc_str=str(c.get("Vencimiento", "")))
 
     # Long puts
     if not puts.empty:
@@ -2104,40 +2243,49 @@ def build_strategy_advisor(analyzed, S, prob_dict, T_expiry, mu, hv, max_loss_pc
             K = float(p_row["Strike"]); p = float(p_row["prima_ref"])
             legs = [("buy", "put", K, p, 1)]
             breakeven = K - p
-            add_row("Put comprado", p_row["Ticker"], "", "", "", "Bajista fuerte", "Alta, limitada por subyacente a cero", legs, breakeven, float(p_row["Score Busa"]), "Potencial bajista con riesgo limitado a prima.")
+            add_row("Put comprado", p_row["Ticker"], "", "", "", "Bajista fuerte", "Alta, limitada por subyacente a cero", legs, breakeven, float(p_row["Score Busa"]), "Potencial bajista con riesgo limitado a prima.", T_leg=_row_T(p_row, T_expiry), venc_str=str(p_row.get("Vencimiento", "")))
 
-    # Bull call spreads
+    # Bull call spreads (sólo entre opciones del mismo vencimiento)
     if len(calls) >= 2:
         base_calls = calls[(calls["Strike"] >= S * 0.92) & (calls["Strike"] <= S * 1.10)].sort_values("Score Busa", ascending=False).head(6)
         for _, buy in base_calls.iterrows():
             higher = calls[calls["Strike"] > buy["Strike"]].head(5)
             for _, sell in higher.iterrows():
+                venc_buy, venc_sell = str(buy.get("Vencimiento", "")), str(sell.get("Vencimiento", ""))
+                if venc_buy and venc_sell and venc_buy != venc_sell:
+                    continue  # no mezclar vencimientos distintos en un mismo spread
                 p_buy = float(buy["prima_ref"]); p_sell = float(sell["prima_ref"]); net = p_buy - p_sell
                 if net <= 0: continue
                 legs = [("buy", "call", float(buy["Strike"]), p_buy, 1), ("sell", "call", float(sell["Strike"]), p_sell, 1)]
                 breakeven = float(buy["Strike"]) + net
                 score_base = np.nanmean([buy["Score Busa"], sell["Score Busa"]])
-                add_row("Bull Call Spread", buy["Ticker"], sell["Ticker"], "", "", "Alcista moderado", "Limitada", legs, breakeven, score_base, "Menor costo y menor riesgo que call comprado.")
+                add_row("Bull Call Spread", buy["Ticker"], sell["Ticker"], "", "", "Alcista moderado", "Limitada", legs, breakeven, score_base, "Menor costo y menor riesgo que call comprado.", T_leg=_row_T(buy, T_expiry), venc_str=venc_buy or venc_sell)
 
-    # Bear put spreads
+    # Bear put spreads (sólo entre opciones del mismo vencimiento)
     if len(puts) >= 2:
         base_puts = puts[(puts["Strike"] >= S * 0.90) & (puts["Strike"] <= S * 1.08)].sort_values("Score Busa", ascending=False).head(6)
         for _, buy in base_puts.iterrows():
             lower = puts[puts["Strike"] < buy["Strike"]].tail(5)
             for _, sell in lower.iterrows():
+                venc_buy, venc_sell = str(buy.get("Vencimiento", "")), str(sell.get("Vencimiento", ""))
+                if venc_buy and venc_sell and venc_buy != venc_sell:
+                    continue
                 p_buy = float(buy["prima_ref"]); p_sell = float(sell["prima_ref"]); net = p_buy - p_sell
                 if net <= 0: continue
                 legs = [("buy", "put", float(buy["Strike"]), p_buy, 1), ("sell", "put", float(sell["Strike"]), p_sell, 1)]
                 breakeven = float(buy["Strike"]) - net
                 score_base = np.nanmean([buy["Score Busa"], sell["Score Busa"]])
-                add_row("Bear Put Spread", buy["Ticker"], sell["Ticker"], "", "", "Bajista moderado", "Limitada", legs, breakeven, score_base, "Menor costo y menor riesgo que put comprado.")
+                add_row("Bear Put Spread", buy["Ticker"], sell["Ticker"], "", "", "Bajista moderado", "Limitada", legs, breakeven, score_base, "Menor costo y menor riesgo que put comprado.", T_leg=_row_T(buy, T_expiry), venc_str=venc_buy or venc_sell)
 
-    # Straddle / Strangle long for movement
+    # Straddle / Strangle long for movement (sólo entre opciones del mismo vencimiento)
     if len(calls) >= 1 and len(puts) >= 1:
         near_calls = calls.iloc[(calls["Strike"] - S).abs().argsort()[:4]]
         near_puts = puts.iloc[(puts["Strike"] - S).abs().argsort()[:4]]
         for _, c in near_calls.iterrows():
             for _, p_row in near_puts.iterrows():
+                venc_c, venc_p = str(c.get("Vencimiento", "")), str(p_row.get("Vencimiento", ""))
+                if venc_c and venc_p and venc_c != venc_p:
+                    continue
                 pc = float(c["prima_ref"]); pp = float(p_row["prima_ref"])
                 legs = [("buy", "call", float(c["Strike"]), pc, 1), ("buy", "put", float(p_row["Strike"]), pp, 1)]
                 if abs(float(c["Strike"]) - float(p_row["Strike"])) < 1e-9:
@@ -2146,9 +2294,9 @@ def build_strategy_advisor(analyzed, S, prob_dict, T_expiry, mu, hv, max_loss_pc
                     strat = "Long Strangle"
                 bkeven = np.nan
                 score_base = np.nanmean([c["Score Busa"], p_row["Score Busa"]])
-                add_row(strat, c["Ticker"], p_row["Ticker"], "", "", "Movimiento fuerte", "Ilimitada al alza / alta a la baja", legs, bkeven, score_base, "Apuesta a movimiento fuerte. Riesgo limitado a primas.")
+                add_row(strat, c["Ticker"], p_row["Ticker"], "", "", "Movimiento fuerte", "Ilimitada al alza / alta a la baja", legs, bkeven, score_base, "Apuesta a movimiento fuerte. Riesgo limitado a primas.", T_leg=_row_T(c, T_expiry), venc_str=venc_c or venc_p)
 
-    # Butterfly with calls: lateral / target
+    # Butterfly with calls: lateral / target (mismo vencimiento en las 3 patas por construcción, ya que se arma dentro de 'calls')
     if len(calls) >= 3:
         strikes = sorted(calls["Strike"].unique())
         for i in range(1, len(strikes)-1):
@@ -2163,13 +2311,17 @@ def build_strategy_advisor(analyzed, S, prob_dict, T_expiry, mu, hv, max_loss_pc
             if r1.empty or r2.empty or r3.empty:
                 continue
             r1, r2, r3 = r1.iloc[0], r2.iloc[0], r3.iloc[0]
+            venc1, venc2, venc3 = str(r1.get("Vencimiento", "")), str(r2.get("Vencimiento", "")), str(r3.get("Vencimiento", ""))
+            vencs_conocidos = [v for v in [venc1, venc2, venc3] if v]
+            if len(set(vencs_conocidos)) > 1:
+                continue  # las 3 patas deben compartir vencimiento
             legs = [
                 ("buy", "call", float(k1), float(r1["prima_ref"]), 1),
                 ("sell", "call", float(k2), float(r2["prima_ref"]), 2),
                 ("buy", "call", float(k3), float(r3["prima_ref"]), 1),
             ]
             score_base = np.nanmean([r1["Score Busa"], r2["Score Busa"], r3["Score Busa"]])
-            add_row("Long Call Butterfly", r1["Ticker"], r2["Ticker"], r3["Ticker"], "", "Lateral / objetivo cercano", "Limitada", legs, np.nan, score_base, "Riesgo definido. Busca cierre cerca del strike central.")
+            add_row("Long Call Butterfly", r1["Ticker"], r2["Ticker"], r3["Ticker"], "", "Lateral / objetivo cercano", "Limitada", legs, np.nan, score_base, "Riesgo definido. Busca cierre cerca del strike central.", T_leg=_row_T(r1, T_expiry), venc_str=venc1 or venc2 or venc3)
             break
 
     out = pd.DataFrame(rows)
@@ -2218,7 +2370,8 @@ with st.sidebar:
         horizon = st.number_input("Horizonte", 1, 120, 20)
         lateral = st.number_input("Lateral +/- %", 0.5, 30.0, 5.0, .5) / 100
         r = st.number_input("Tasa caución %", 0.0, 200.0, 20.2, .1) / 100
-        days = st.number_input("Días vencimiento", 1, 365, 52)
+        days = st.number_input("Días vencimiento (respaldo)", 1, 365, 52,
+                                help="Ya no es el valor principal: cada opción calcula su propio vencimiento automáticamente a partir del ticker (tercer viernes del mes que indican sus 2 últimas letras). Esto solo se usa si un ticker no se puede interpretar.")
 
     with st.expander("Modelo de pronóstico", expanded=False):
         st.caption("El retorno medio histórico es un estimador ruidoso de la tendencia futura. Estos controles moderan ese ruido.")
@@ -2691,6 +2844,7 @@ with tabs[4]:
             c5.metric("Valor esperado", f"{best['Valor esperado']:.2f}")
             c6.metric("Liquidez", f"{best['Liquidez']:.0f}/100")
 
+            st.write(f"**Qué comprar/vender:** {best['Acción por pata']}")
             st.write(f"**Comentario:** {best['Comentario']}")
             st.write(f"**Ganancia:** {best['Ganancia']}")
             st.write(f"**Pérdida máxima estimada:** {best['Pérdida máx.']:.2f}")
@@ -2700,24 +2854,33 @@ with tabs[4]:
                 st.write(f"**Break-even:** {best['Break-even']:.2f}")
 
             st.markdown("### Ranking de estrategias")
+            st.caption("Columna 'Acción por pata': indica Compra/Venta para cada Ticker 1-4, en el mismo orden. Se arma directo de la estrategia real, no hay que adivinarlo por el nombre.")
             display_cols = [c for c in advisor.columns if c != "Legs"]
             st.dataframe(advisor[display_cols].head(20), use_container_width=True)
 
-            # Payoff de la estrategia ganadora: se arma directamente con las
-            # patas guardadas por el Advisor (antes se reconstruía adivinando
-            # por nombre de estrategia, lo que fallaba para straddle/strangle,
-            # bear put spread y butterfly).
+            # Payoff: por default muestra la #1, pero se puede elegir
+            # cualquier fila del ranking (antes sólo se graficaba la #1).
+            st.markdown("### Gráfico de payoff")
+            top_n = advisor.head(20).reset_index(drop=True)
+            opciones_chart = [
+                f"{int(r['Ranking'])} - {r['Estrategia']} ({r['Ticker 1']}" + (f" / {r['Ticker 2']}" if r["Ticker 2"] else "") + ")"
+                for _, r in top_n.iterrows()
+            ]
+            idx_chart = st.selectbox("Elegí qué estrategia del ranking graficar", range(len(opciones_chart)), format_func=lambda i: opciones_chart[i])
+            elegida = top_n.iloc[idx_chart]
+
             prices_adv = np.linspace(S * 0.70, S * 1.35, 300)
-            legs_adv = best.get("Legs", [])
+            legs_adv = elegida.get("Legs", [])
 
             if legs_adv:
                 payoff_adv, net_cost_adv = strategy_payoff(legs_adv, prices_adv)
                 fig_adv = go.Figure()
-                fig_adv.add_trace(go.Scatter(x=prices_adv, y=payoff_adv, name="Payoff recomendación", mode="lines"))
+                fig_adv.add_trace(go.Scatter(x=prices_adv, y=payoff_adv, name="Payoff", mode="lines"))
                 fig_adv.add_hline(y=0, line_dash="dash")
                 fig_adv.add_vline(x=S, line_dash="dot", annotation_text="Precio actual")
                 fig_adv.update_layout(template="plotly_dark", height=460, xaxis_title="Precio al vencimiento", yaxis_title="Resultado", hovermode="x unified")
                 st.plotly_chart(fig_adv, use_container_width=True)
+                st.caption(f"Patas: {elegida['Acción por pata']}")
 
             st.caption("Herramienta educativa. No constituye recomendación financiera personalizada.")
 
@@ -2748,9 +2911,9 @@ with tabs[5]:
     st.caption("Trae tus posiciones de opciones de GGAL e YPF desde IOL y sugiere Vender / Mantener / Vigilar según el pronóstico Busa AI y el veredicto técnico vigentes.")
 
     dias_venc_cartera = st.number_input(
-        "Días a vencimiento a usar para estimar (aplica a todas las posiciones)",
+        "Días a vencimiento (respaldo, sólo si un ticker no se puede interpretar)",
         min_value=1, max_value=365, value=int(days), step=1,
-        help="La cartera de IOL no siempre indica el vencimiento exacto por posición. Ajustá este número si tus opciones vencen en una fecha distinta a la configurada en 'Parámetros'.",
+        help="Cada posición ahora calcula su propio vencimiento automáticamente a partir del ticker (tercer viernes del mes que indican sus 2 últimas letras). Este número sólo se usa como respaldo si algún ticker no se puede interpretar.",
     )
 
     if st.button("📂 Traer mi cartera de IOL"):
@@ -2775,6 +2938,14 @@ with tabs[5]:
             st.dataframe(port_df, use_container_width=True)
         else:
             resultados = []
+            detalles_extra = {}
+
+            client_pos = None
+            try:
+                client_pos = IOLClient.from_config()
+            except Exception:
+                client_pos = None
+
             for _, pos in opciones_port.iterrows():
                 ticker = pos["Ticker"]
                 subyacente = underlying_for_option(ticker)
@@ -2789,33 +2960,88 @@ with tabs[5]:
                 prob_pos = apply_learning_to_probabilities(prob_pos, subyacente, int(learning_window), int(learning_prior_strength))
                 S_pos = float(prob_pos["S"])
                 hv_pos = prob_pos["VH"]
+                close_pos = h_pos["Close"].dropna()
 
-                rsi_pos = compute_rsi(h_pos["Close"].dropna())
-                macd_pos, macd_signal_pos, macd_hist_pos = compute_macd(h_pos["Close"].dropna())
-                sma20_pos, bb_up_pos, bb_dn_pos = compute_bollinger(h_pos["Close"].dropna())
-                ema50_pos = h_pos["Close"].dropna().ewm(span=50, adjust=False).mean()
-                adx_pos, plus_di_pos, minus_di_pos = compute_adx(h_pos["High"], h_pos["Low"], h_pos["Close"].dropna())
+                rsi_pos = compute_rsi(close_pos)
+                macd_pos, macd_signal_pos, macd_hist_pos = compute_macd(close_pos)
+                sma20_pos, bb_up_pos, bb_dn_pos = compute_bollinger(close_pos)
+                ema50_pos = close_pos.ewm(span=50, adjust=False).mean()
+                adx_pos, plus_di_pos, minus_di_pos = compute_adx(h_pos["High"], h_pos["Low"], close_pos)
+                volumen_pos_series = h_pos["Volume"] if "Volume" in h_pos.columns else None
                 veredicto_pos, _, _, _, _ = technical_verdict(
-                    rsi_pos, macd_pos, macd_signal_pos, h_pos["Close"].dropna(), sma20_pos, ema50_pos,
-                    h_pos["Volume"] if "Volume" in h_pos.columns else None, adx_pos, plus_di_pos, minus_di_pos,
+                    rsi_pos, macd_pos, macd_signal_pos, close_pos, sma20_pos, ema50_pos,
+                    volumen_pos_series, adx_pos, plus_di_pos, minus_di_pos,
                 )
 
                 m = re.search(r"(\d{3,6})", ticker)
                 strike = clean_num(m.group(1)) if m else np.nan
 
-                T_pos = dias_venc_cartera / 365
+                # Vencimiento automático por ticker; si no se puede interpretar,
+                # cae al respaldo manual.
+                fecha_venc_pos, dias_venc_pos, fuente_venc_pos = parse_option_expiry(ticker)
+                if fecha_venc_pos is None:
+                    dias_venc_pos = dias_venc_cartera
+                    fuente_venc_pos = "manual"
+                T_pos = max(dias_venc_pos, 1) / 365
+
+                # Cotización en vivo de ESTA opción puntual (más precisa que el
+                # 'UltimoPrecio' de la cartera, que puede estar desactualizado).
+                compra_op = venta_op = vol_compra_op = vol_venta_op = np.nan
+                if client_pos is not None:
+                    try:
+                        q_pos = client_pos.get_quote(ticker)
+                        campos_q = extract_option_quote_fields(q_pos)
+                        compra_op = campos_q.get("Compra", np.nan)
+                        venta_op = campos_q.get("Venta", np.nan)
+                        vol_compra_op = campos_q.get("Vol. Compra", np.nan)
+                        vol_venta_op = campos_q.get("Vol. Venta", np.nan)
+                    except Exception:
+                        pass
+
+                if not np.isnan(compra_op) and not np.isnan(venta_op):
+                    prima_actual = (compra_op + venta_op) / 2
+                    fuente_precio_pos = "cotización en vivo (mid)"
+                else:
+                    prima_actual = clean_num(pos.get("UltimoPrecio"))
+                    fuente_precio_pos = "cartera IOL (puede estar desactualizado)"
+
                 theo_pos = bs_price(S_pos, strike, T_pos, r, hv_pos, typ) if not np.isnan(strike) else np.nan
-                prima_actual = clean_num(pos.get("UltimoPrecio"))
+                iv_pos = implied_vol(prima_actual, S_pos, strike, T_pos, r, typ) if (not np.isnan(prima_actual) and not np.isnan(strike)) else np.nan
+                sig_pos = iv_pos if not np.isnan(iv_pos) else hv_pos
+                if not np.isnan(strike):
+                    delta_pos, gamma_pos, vega_pos, theta_pos, rho_pos, prob_itm_pos = greeks(S_pos, strike, T_pos, r, sig_pos, typ)
+                else:
+                    delta_pos = gamma_pos = vega_pos = theta_pos = rho_pos = prob_itm_pos = np.nan
+
                 intrinsic_pos = max(S_pos - strike, 0) if typ == "call" else max(strike - S_pos, 0) if not np.isnan(strike) else np.nan
                 extrinsic_pos = (prima_actual - intrinsic_pos) if (not np.isnan(prima_actual) and not np.isnan(intrinsic_pos)) else np.nan
 
+                liquidez_pos = np.nan
+                if not (np.isnan(vol_compra_op) and np.isnan(vol_venta_op)):
+                    score_liq = 50.0
+                    vol_total = np.nansum([vol_compra_op, vol_venta_op])
+                    if vol_total >= 500: score_liq += 25
+                    elif vol_total >= 100: score_liq += 10
+                    elif vol_total <= 5: score_liq -= 20
+                    if not np.isnan(compra_op) and not np.isnan(venta_op) and venta_op > 0:
+                        spread_pct = (venta_op - compra_op) / venta_op * 100
+                        if spread_pct <= 3: score_liq += 25
+                        elif spread_pct <= 8: score_liq += 10
+                        elif spread_pct >= 20: score_liq -= 25
+                    liquidez_pos = float(np.clip(score_liq, 0, 100))
+
+                valor_esperado_mantener, valor_cierre_ahora = position_expected_value(
+                    typ, strike, pos.get("Cantidad"), prima_actual, S_pos, T_pos, prob_pos.get("Mu ajustada", 0.0), hv_pos
+                )
+
                 accion, score_pos, razones_pos, pnl_pct = recommend_option_action(
-                    typ, pos.get("Cantidad"), dias_venc_cartera, extrinsic_pos, prima_actual, pos.get("PPC"),
-                    prob_pos, veredicto_pos,
+                    typ, pos.get("Cantidad"), dias_venc_pos, extrinsic_pos, prima_actual, pos.get("PPC"),
+                    prob_pos, veredicto_pos, valor_esperado_mantener, valor_cierre_ahora, liquidez_pos,
                 )
 
                 resultados.append({
                     "Ticker": ticker,
+                    "Vencimiento": fecha_venc_pos.strftime("%d/%m/%Y") if fecha_venc_pos is not None else f"~{dias_venc_pos}d (manual)",
                     "Subyacente": subyacente,
                     "Tipo": typ.upper(),
                     "Cantidad": pos.get("Cantidad"),
@@ -2826,6 +3052,18 @@ with tabs[5]:
                     "Acción sugerida": accion,
                     "Razones": " · ".join(razones_pos),
                 })
+
+                detalles_extra[ticker] = dict(
+                    subyacente=subyacente, dias_venc_pos=dias_venc_pos, fuente_precio_pos=fuente_precio_pos,
+                    prob_pos=prob_pos, rsi_pos=rsi_pos, macd_pos=macd_pos, macd_signal_pos=macd_signal_pos,
+                    macd_hist_pos=macd_hist_pos, sma20_pos=sma20_pos, bb_up_pos=bb_up_pos, bb_dn_pos=bb_dn_pos,
+                    ema50_pos=ema50_pos, adx_pos=adx_pos, plus_di_pos=plus_di_pos, minus_di_pos=minus_di_pos,
+                    close_pos=close_pos, volumen_pos_series=volumen_pos_series,
+                    delta_pos=delta_pos, gamma_pos=gamma_pos, vega_pos=vega_pos, theta_pos=theta_pos,
+                    intrinsic_pos=intrinsic_pos, extrinsic_pos=extrinsic_pos,
+                    compra_op=compra_op, venta_op=venta_op, liquidez_pos=liquidez_pos,
+                    valor_esperado_mantener=valor_esperado_mantener, valor_cierre_ahora=valor_cierre_ahora,
+                )
 
             if not resultados:
                 st.warning("No pude procesar las posiciones encontradas (faltan datos de precio o strike). Revisá 'Debug IOL'.")
@@ -2838,12 +3076,60 @@ with tabs[5]:
                     use_container_width=True,
                 )
                 st.markdown("#### Detalle por posición")
+                st.caption("Cada posición se analiza con la misma información que el resto de la app: pronóstico Busa AI, RSI/MACD/Bollinger/ADX del subyacente, griegas de la opción, liquidez puntual y una comparación de valor esperado entre mantener y cerrar ahora.")
                 for _, r_row in res_df.iterrows():
+                    ticker = r_row["Ticker"]
+                    extra = detalles_extra.get(ticker, {})
                     css_class = "score-good" if r_row["Acción sugerida"] == "MANTENER" else "score-bad" if r_row["Acción sugerida"] == "VENDER" else "score-mid"
                     with st.container(border=True):
-                        st.markdown(f"**{r_row['Ticker']}** ({r_row['Subyacente']}, {r_row['Tipo']}) — <span class='{css_class}'>{r_row['Acción sugerida']}</span>", unsafe_allow_html=True)
+                        st.markdown(
+                            f"##### {ticker} ({r_row['Subyacente']}, {r_row['Tipo']}) — "
+                            f"<span class='{css_class}' style='font-size:20px;'>{r_row['Acción sugerida']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        c1.metric("Cantidad", "" if pd.isna(r_row["Cantidad"]) else f"{r_row['Cantidad']:.0f}")
+                        c2.metric("PPC", "" if pd.isna(r_row["PPC"]) else f"{r_row['PPC']:.2f}")
+                        c3.metric("Precio actual", "" if pd.isna(r_row["Último"]) else f"{r_row['Último']:.2f}")
+                        c4.metric("P&L %", "" if pd.isna(r_row["P&L %"]) else f"{r_row['P&L %']:.1f}%")
+                        c5.metric("Días venc.", extra.get("dias_venc_pos", ""))
+                        st.caption(f"Vencimiento: {r_row['Vencimiento']} | Precio de referencia: {extra.get('fuente_precio_pos', '')}")
+
+                        if extra:
+                            st.markdown("**Griegas de la posición**")
+                            g1, g2, g3, g4, g5 = st.columns(5)
+                            g1.metric("Delta", "" if pd.isna(extra.get("delta_pos", np.nan)) else f"{extra['delta_pos']:.3f}")
+                            g2.metric("Gamma", "" if pd.isna(extra.get("gamma_pos", np.nan)) else f"{extra['gamma_pos']:.4f}")
+                            g3.metric("Theta diario", "" if pd.isna(extra.get("theta_pos", np.nan)) else f"{extra['theta_pos']:.2f}")
+                            g4.metric("Vega x1%", "" if pd.isna(extra.get("vega_pos", np.nan)) else f"{extra['vega_pos']:.2f}")
+                            g5.metric("Extrínseco", "" if pd.isna(extra.get("extrinsic_pos", np.nan)) else f"{extra['extrinsic_pos']:.2f}")
+
+                            st.markdown(f"**Contexto técnico de {extra['subyacente']}**")
+                            pp = extra["prob_pos"]
+                            st.write(f"🎯 Busa AI: Sube {pp['Sube']:.0%} · Baja {pp['Baja']:.0%} · Lateral {pp['Lateral']:.0%}")
+                            st.write(f"📈 {rsi_expert_reading(extra['rsi_pos'])}")
+                            st.write(f"📊 {macd_expert_reading(extra['macd_pos'], extra['macd_signal_pos'], extra['macd_hist_pos'])}")
+                            st.write(f"📉 {bollinger_expert_reading(extra['close_pos'], extra['sma20_pos'], extra['bb_up_pos'], extra['bb_dn_pos'])}")
+                            st.write(f"📐 {trend_expert_reading(extra['close_pos'], extra['ema50_pos'])}")
+                            st.write(f"🧭 {adx_expert_reading(extra['adx_pos'], extra['plus_di_pos'], extra['minus_di_pos'])}")
+                            if extra.get("volumen_pos_series") is not None:
+                                st.write(f"📦 {volume_expert_reading(extra['volumen_pos_series'], extra['close_pos'])}")
+
+                            st.markdown("**Valor esperado: mantener vs. cerrar ahora**")
+                            v1, v2 = st.columns(2)
+                            vem = extra.get("valor_esperado_mantener", np.nan)
+                            vca = extra.get("valor_cierre_ahora", np.nan)
+                            v1.metric("Cerrar ahora", "" if pd.isna(vca) else f"{vca:,.0f}")
+                            v2.metric("Valor esperado (mantener)", "" if pd.isna(vem) else f"{vem:,.0f}")
+                            liq_txt = f"Liquidez de esta opción puntual: {extra['liquidez_pos']:.0f}/100" if not pd.isna(extra.get("liquidez_pos", np.nan)) else "Liquidez de esta opción puntual: sin datos en vivo"
+                            if not pd.isna(extra.get("compra_op", np.nan)) and not pd.isna(extra.get("venta_op", np.nan)):
+                                liq_txt += f" | Compra {extra['compra_op']:.2f} / Venta {extra['venta_op']:.2f}"
+                            st.caption(liq_txt)
+
+                        st.markdown("**Por qué esta recomendación**")
                         st.caption(r_row["Razones"])
-                st.caption("Recomendación basada en reglas explícitas (pronóstico Busa AI + veredicto técnico + tiempo/valor extrínseco). No es asesoramiento financiero personalizado — la decisión final es tuya.")
+
+                st.caption("Recomendación basada en reglas explícitas + comparación de valor esperado bajo el modelo de pronóstico vigente. No es asesoramiento financiero personalizado — la decisión final es tuya.")
 
     with st.expander("Debug IOL — Cartera", expanded=False):
         if "portfolio_raw" in st.session_state:
