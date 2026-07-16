@@ -5,3 +5,4 @@ yfinance
 scipy
 plotly
 requests
+PyOBD

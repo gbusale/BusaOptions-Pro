@@ -1,6 +1,7 @@
 
 import json
 import hmac
+import re
 from pathlib import Path
 from datetime import datetime, time
 import streamlit as st
@@ -25,6 +26,11 @@ if not hasattr(IOLClient, "get_history"):
     def _iol_get_history(self, simbolo: str, fecha_desde: str, fecha_hasta: str, ajustada: str = "SinAjustar", mercado: str = "bCBA"):
         return self.get(f"/api/v2/{mercado}/Titulos/{simbolo}/Cotizacion/seriehistorica/{fecha_desde}/{fecha_hasta}/{ajustada}")
     IOLClient.get_history = _iol_get_history
+
+if not hasattr(IOLClient, "get_portfolio"):
+    def _iol_get_portfolio(self, pais: str = "argentina"):
+        return self.get(f"/api/v2/portafolio/{pais}")
+    IOLClient.get_portfolio = _iol_get_portfolio
 
 st.set_page_config(page_title="BusaOptions Pro", layout="wide")
 
@@ -92,8 +98,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.6")
-st.caption("IOL + Black-Scholes + Busa AI + Advisor cuantitativo + Learning bayesiano + Análisis técnico profesional (RSI/MACD/Bollinger/Volumen/ADX).")
+st.title("BusaOptions Pro 9.9")
+st.caption("IOL + Black-Scholes + Busa AI + Advisor cuantitativo + Learning bayesiano + Análisis técnico + Cartera IOL + segunda fuente BYMA.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL"},
@@ -747,6 +753,27 @@ def clean_num(x):
         return np.nan
 
 
+def sum_puntas_field(niveles, *keys):
+    """
+    Suma un campo (ej. cantidadCompra) a través de TODOS los niveles del
+    libro de puntas que devuelva IOL, en vez de quedarse solo con el primer
+    nivel (que es lo que muestra la 'caja de puntas' de un vistazo). Si IOL
+    sólo manda un nivel, la suma coincide con ese único valor.
+    """
+    total = 0.0
+    encontrado = False
+    for n in niveles:
+        if not isinstance(n, dict):
+            continue
+        for k in keys:
+            v = clean_num(n.get(k))
+            if not np.isnan(v):
+                total += v
+                encontrado = True
+                break
+    return total if encontrado else np.nan
+
+
 def extract_iol_quote_price(raw_quote):
     """
     Extrae precio del subyacente desde IOL.
@@ -780,10 +807,71 @@ def extract_iol_quote_price(raw_quote):
     return np.nan
 
 
+def get_secondary_quote_byma(local_ticker, settlement="48hs"):
+    """
+    Segunda fuente de datos para el PAPEL (no las opciones): usa la librería
+    PyOBD (datos abiertos de BYMA, sin cuenta de broker) como cruce
+    independiente de IOL. Pensada para nunca romper la app: si la librería
+    no está instalada, si cambió su formato de respuesta, o hay cualquier
+    error de red, devuelve None sin propagar la excepción.
+
+    Nota de honestidad: no pude probar el formato exacto de respuesta de
+    PyOBD en este entorno (sandbox sin salida a internet financiero) --
+    el parseo de campos en parse_byma_secondary_fields es una primera
+    aproximación que puede necesitar ajuste con datos reales.
+    """
+    try:
+        from pyobd import BymaData
+    except Exception:
+        return None
+    try:
+        client = BymaData()
+        q = client.get_current_quote(local_ticker, settlement=settlement)
+        if hasattr(q, "iloc"):
+            try:
+                q = q.iloc[0].to_dict()
+            except Exception:
+                q = q.to_dict() if hasattr(q, "to_dict") else None
+        elif hasattr(q, "to_dict"):
+            q = q.to_dict()
+        return q if isinstance(q, dict) else None
+    except Exception:
+        return None
+
+
+def parse_byma_secondary_fields(q):
+    """
+    Extracción best-effort de compra/venta/tamaños/volumen desde la
+    respuesta de PyOBD. Prueba nombres en inglés (estilo pyhomebroker,
+    con el que PyOBD dice ser compatible) y en español (estilo IOL), y
+    deja en NaN lo que no encuentre -- no inventa valores.
+    """
+    if not isinstance(q, dict):
+        return {}
+
+    def _get(*keys):
+        for k in keys:
+            if k in q:
+                v = clean_num(q[k])
+                if not np.isnan(v):
+                    return v
+        return np.nan
+
+    return {
+        "Compra (BYMA)": _get("bid", "precioCompra", "compra"),
+        "Venta (BYMA)": _get("ask", "precioVenta", "venta"),
+        "Vol. Compra (BYMA)": _get("bid_size", "bidSize", "cantidadCompra"),
+        "Vol. Venta (BYMA)": _get("ask_size", "askSize", "cantidadVenta"),
+        "Volumen (BYMA)": _get("volume", "volumen", "nominalVolume", "volumenNominal"),
+        "Último (BYMA)": _get("last", "ultimoPrecio", "ultimo", "close", "price"),
+    }
+
+
 def extract_option_quote_fields(raw_quote):
     """
-    Extrae Compra, Venta, Último y Volumen desde cotización individual IOL.
-    Está preparado para estructuras con cotizacion/puntas en dict o lista.
+    Extrae Compra, Venta, Vol. Compra, Vol. Venta, Último y Volumen desde
+    cotización individual IOL. Está preparado para estructuras con
+    cotizacion/puntas en dict o lista.
     """
     if not isinstance(raw_quote, dict):
         return {}
@@ -793,10 +881,13 @@ def extract_option_quote_fields(raw_quote):
     puntas_raw = cot.get("puntas") or raw_quote.get("puntas")
     if isinstance(puntas_raw, list) and len(puntas_raw) > 0 and isinstance(puntas_raw[0], dict):
         puntas = puntas_raw[0]
+        niveles = [p for p in puntas_raw if isinstance(p, dict)]
     elif isinstance(puntas_raw, dict):
         puntas = puntas_raw
+        niveles = [puntas_raw]
     else:
         puntas = {}
+        niveles = []
 
     compra = clean_num(
         puntas.get("precioCompra")
@@ -815,6 +906,14 @@ def extract_option_quote_fields(raw_quote):
         or raw_quote.get("precioVenta")
         or raw_quote.get("venta")
     )
+
+    vol_compra = sum_puntas_field(niveles, "cantidadCompra")
+    if np.isnan(vol_compra):
+        vol_compra = clean_num(cot.get("cantidadCompra") or raw_quote.get("cantidadCompra"))
+
+    vol_venta = sum_puntas_field(niveles, "cantidadVenta")
+    if np.isnan(vol_venta):
+        vol_venta = clean_num(cot.get("cantidadVenta") or raw_quote.get("cantidadVenta"))
 
     ultimo = clean_num(
         cot.get("ultimoPrecio")
@@ -835,6 +934,8 @@ def extract_option_quote_fields(raw_quote):
     return {
         "Compra": compra,
         "Venta": venta,
+        "Vol. Compra": vol_compra,
+        "Vol. Venta": vol_venta,
         "Último": ultimo,
         "Volumen": volumen,
     }
@@ -852,7 +953,9 @@ def merge_top_quotes_into_options(options_df, quotes_by_ticker):
         mask = df["Ticker"].astype(str).str.upper() == str(ticker).upper()
         if not mask.any():
             continue
-        for col in ["Compra", "Venta", "Último", "Volumen"]:
+        for col in ["Compra", "Venta", "Vol. Compra", "Vol. Venta", "Último", "Volumen"]:
+            if col not in df.columns:
+                df[col] = np.nan
             val = fields.get(col, np.nan)
             if not np.isnan(clean_num(val)):
                 df.loc[mask, col] = val
@@ -1012,10 +1115,20 @@ def normalize_options(raw):
         puntas_raw = cot.get("puntas") or item.get("puntas")
         if isinstance(puntas_raw, list) and len(puntas_raw) > 0 and isinstance(puntas_raw[0], dict):
             puntas = puntas_raw[0]
+            niveles = [p for p in puntas_raw if isinstance(p, dict)]
         elif isinstance(puntas_raw, dict):
             puntas = puntas_raw
+            niveles = [puntas_raw]
         else:
             puntas = {}
+            niveles = []
+
+        vol_compra_item = sum_puntas_field(niveles, "cantidadCompra")
+        if np.isnan(vol_compra_item):
+            vol_compra_item = clean_num(cot.get("cantidadCompra") or item.get("cantidadCompra"))
+        vol_venta_item = sum_puntas_field(niveles, "cantidadVenta")
+        if np.isnan(vol_venta_item):
+            vol_venta_item = clean_num(cot.get("cantidadVenta") or item.get("cantidadVenta"))
 
         simbolo = titulo.get("simbolo") or item.get("simbolo") or item.get("ticker") or item.get("descripcion") or ""
         strike = item.get("precioEjercicio") or item.get("strike") or titulo.get("precioEjercicio") or titulo.get("strike")
@@ -1043,11 +1156,144 @@ def normalize_options(raw):
                 or item.get("precioVenta")
                 or item.get("venta")
             ),
+            "Vol. Compra": vol_compra_item,
+            "Vol. Venta": vol_venta_item,
             "Último": clean_num(cot.get("ultimoPrecio") or cot.get("ultimo") or cot.get("precio") or item.get("ultimo")),
             "Volumen": clean_num(cot.get("volumen") or item.get("volumen")),
         })
     df = pd.DataFrame(rows)
     return df.dropna(subset=["Strike"]).sort_values(["Tipo", "Strike", "Ticker"]) if not df.empty else df
+
+
+def normalize_portfolio(raw):
+    """
+    Parsea la respuesta de /api/v2/portafolio/{pais}. La estructura exacta de
+    IOL no está 100% documentada acá, así que se prueban varias claves
+    habituales (activos/titulo/tipo) de forma defensiva -- igual que se hace
+    con normalize_options. Si algo no matchea, se puede revisar la respuesta
+    cruda en el expander "Debug IOL" y ajustar las claves.
+    """
+    if isinstance(raw, dict):
+        for key in ["activos", "data", "result", "items", "portafolio"]:
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+    if not isinstance(raw, list):
+        return pd.DataFrame()
+
+    rows = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        titulo = item.get("titulo") if isinstance(item.get("titulo"), dict) else {}
+        simbolo = titulo.get("simbolo") or item.get("simbolo") or item.get("ticker") or ""
+        tipo_activo = str(titulo.get("tipo") or item.get("tipo") or "").lower()
+
+        rows.append({
+            "Ticker": str(simbolo).upper(),
+            "TipoActivo": tipo_activo,
+            "Cantidad": clean_num(item.get("cantidad")),
+            "PPC": clean_num(item.get("ppc") or item.get("precioPromedioCompra") or item.get("precioCompra")),
+            "UltimoPrecio": clean_num(item.get("ultimoPrecio") or item.get("precioActual") or titulo.get("ultimoPrecio")),
+            "Valorizado": clean_num(item.get("valorizado") or item.get("montoValorizado")),
+            "GananciaPorcentaje": clean_num(item.get("gananciaPorcentaje") or item.get("variacionPorcentual")),
+            "GananciaDinero": clean_num(item.get("gananciaDinero")),
+        })
+    return pd.DataFrame(rows)
+
+
+def is_option_position(row):
+    """Identifica si una fila de cartera es una opción de GGAL o YPF (las únicas que este panel sabe interpretar)."""
+    ticker = str(row.get("Ticker", "")).upper()
+    tipo_activo = str(row.get("TipoActivo", "")).lower()
+    es_serie_conocida = ticker.startswith(("GFGC", "GFGV", "YPFC", "YPFV"))
+    parece_opcion = "opc" in tipo_activo or es_serie_conocida
+    return parece_opcion and es_serie_conocida
+
+
+def underlying_for_option(ticker):
+    ticker = str(ticker).upper()
+    if ticker.startswith(("GFGC", "GFGV")):
+        return "GGAL"
+    if ticker.startswith(("YPFC", "YPFV")):
+        return "YPF"
+    return None
+
+
+def recommend_option_action(typ, cantidad, dias_venc, extrinsic, prima_actual, ppc, prob_dict, veredicto_tecnico):
+    """
+    Recomendación simple y transparente (MANTENER / VIGILAR / VENDER) para una
+    posición de opciones en cartera. Combina:
+    - Hacia dónde favorece el pronóstico Busa AI y el veredicto técnico del
+      subyacente, según si la posición es un call o un put (y si está
+      comprada o vendida/lanzada).
+    - Cuánto tiempo queda al vencimiento.
+    - Cuánto valor extrínseco le queda (si ya no tiene casi nada, poco
+      sentido tiene esperar más).
+
+    No es asesoramiento financiero personalizado: es una lectura basada en
+    reglas explícitas, pensada para acompañar la decisión, no reemplazarla.
+    """
+    razones = []
+    score = 0.0
+
+    vendida = cantidad is not None and not np.isnan(cantidad) and cantidad < 0
+    favorable = "Sube" if typ == "call" else "Baja"
+    contraria = "Baja" if typ == "call" else "Sube"
+    if vendida:
+        favorable, contraria = contraria, favorable
+        razones.append("Posición vendida/lanzada: la lectura de favorable/desfavorable está invertida respecto de una posición comprada.")
+
+    p_fav = float(prob_dict.get(favorable, 0))
+    p_con = float(prob_dict.get(contraria, 0))
+    if p_fav > p_con + 0.10:
+        score += 1
+        razones.append(f"Busa AI favorece {favorable.lower()} ({p_fav:.0%} vs {p_con:.0%}), a favor de la posición.")
+    elif p_con > p_fav + 0.10:
+        score -= 1
+        razones.append(f"Busa AI favorece {contraria.lower()} ({p_con:.0%} vs {p_fav:.0%}), en contra de la posición.")
+    else:
+        razones.append("Busa AI está parejo entre ambos escenarios, sin sesgo claro.")
+
+    favorable_verdict = "SUBE" if favorable == "Sube" else "BAJA"
+    contraria_verdict = "BAJA" if favorable == "Sube" else "SUBE"
+    if veredicto_tecnico == favorable_verdict:
+        score += 1
+        razones.append(f"El veredicto técnico también es {veredicto_tecnico} (a favor).")
+    elif veredicto_tecnico == contraria_verdict:
+        score -= 1
+        razones.append(f"El veredicto técnico es {veredicto_tecnico} (en contra de la posición).")
+    else:
+        razones.append("El veredicto técnico está LATERAL, sin señal direccional clara.")
+
+    if dias_venc is not None and not np.isnan(dias_venc):
+        if dias_venc <= 5:
+            score -= 0.75
+            razones.append(f"Quedan {int(dias_venc)} días para el vencimiento: poco margen para que la tesis se termine de confirmar.")
+        elif dias_venc <= 15:
+            score -= 0.25
+            razones.append(f"Quedan {int(dias_venc)} días para el vencimiento: empieza a correr el tiempo.")
+
+    if extrinsic is not None and not np.isnan(extrinsic) and not np.isnan(prima_actual) and prima_actual > 0:
+        if extrinsic <= 0.05 * prima_actual:
+            score -= 0.5
+            razones.append("Casi no le queda valor extrínseco: ya se movió casi todo lo que tenía para moverse por prima de tiempo.")
+
+    pnl_pct = np.nan
+    if ppc is not None and not np.isnan(ppc) and ppc > 0 and prima_actual is not None and not np.isnan(prima_actual):
+        pnl_pct = (prima_actual - ppc) / ppc * 100
+        if vendida:
+            pnl_pct = -pnl_pct
+
+    if score >= 1.25:
+        accion = "MANTENER"
+    elif score <= -1.25:
+        accion = "VENDER"
+    else:
+        accion = "VIGILAR"
+
+    return accion, score, razones, pnl_pct
+
 
 def analyze(df, S, T, r, hv, p_up, p_down, mode):
     rows = []
@@ -1100,6 +1346,8 @@ def analyze(df, S, T, r, hv, p_up, p_down, mode):
             "Strike": K,
             "Compra": compra,
             "Venta": venta,
+            "Vol. Compra": clean_num(row.get("Vol. Compra")),
+            "Vol. Venta": clean_num(row.get("Vol. Venta")),
             "Último": ultimo,
             "Prima usada": prima,
             "Black-Scholes": theo,
@@ -1123,7 +1371,7 @@ def analyze(df, S, T, r, hv, p_up, p_down, mode):
 
 def fmt(df):
     fmt_map = {c: "{:.2f}" for c in df.columns if pd.api.types.is_numeric_dtype(df[c])}
-    for c in ["Strike", "Score Busa", "Volumen"]:
+    for c in ["Strike", "Score Busa", "Volumen", "Vol. Compra", "Vol. Venta"]:
         if c in fmt_map:
             fmt_map[c] = "{:.0f}"
     if "Delta" in fmt_map:
@@ -1622,17 +1870,8 @@ def render_technical_panel(ticker_key, activo_seleccionado, period, horizon, lat
 
 
 # =========================
-# Estrategias
+# Motor de payoff (usado por Advisor)
 # =========================
-STRATEGIES = {
-    "Call comprado": "Alcista fuerte. Riesgo limitado a la prima pagada.",
-    "Put comprado": "Bajista. Riesgo limitado a la prima pagada.",
-    "Bull Call Spread": "Alcista moderada. Compra call baja y vende call más alta.",
-    "Bear Put Spread": "Bajista moderada. Compra put alta y vende put más baja.",
-    "Straddle comprado": "Apuesta a fuerte movimiento en cualquier dirección.",
-    "Strangle comprado": "Apuesta a movimiento fuerte con menor costo que straddle.",
-}
-
 def first_valid_price(row):
     for col in ["Prima usada", "Último", "Venta", "Compra"]:
         val = clean_num(row.get(col))
@@ -2005,6 +2244,10 @@ with st.sidebar:
             st.session_state["raw_iol"] = raw
             st.session_state["quote_iol"] = quote_raw
             st.session_state["options_df"] = normalize_options(raw)
+            # Vol. Compra/Vol. Venta del PAPEL (no de las opciones): misma
+            # función genérica que ya se usa para las puntas de cada opción,
+            # aplicada acá a la cotización del subyacente.
+            st.session_state["underlying_book"] = extract_option_quote_fields(quote_raw)
 
             if not np.isnan(spot_iol):
                 st.session_state["spot_iol"] = float(spot_iol)
@@ -2147,7 +2390,7 @@ if not df_options.empty:
 # =========================
 # UI
 # =========================
-tabs = st.tabs(["Dashboard", "Opciones", "Probabilidades", "Busa AI", "Advisor", "Estrategias", "Velas", "Favoritos"])
+tabs = st.tabs(["Dashboard", "Opciones", "Probabilidades", "Busa AI", "Advisor", "Favoritos"])
 
 with tabs[0]:
     st.subheader(f"Dashboard {activo}")
@@ -2162,6 +2405,37 @@ with tabs[0]:
     if "last_update" in st.session_state:
         st.caption(f"Último dato/snapshot: {st.session_state['last_update']}")
     st.caption(market_status_text())
+
+    underlying_book = st.session_state.get("underlying_book", {})
+    if underlying_book and (not np.isnan(clean_num(underlying_book.get("Vol. Compra"))) or not np.isnan(clean_num(underlying_book.get("Vol. Venta")))):
+        st.markdown(f"##### Volumen de puntas — {activo} (papel, vía IOL)")
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Vol. Compra", "" if np.isnan(clean_num(underlying_book.get("Vol. Compra"))) else f"{underlying_book['Vol. Compra']:,.0f}")
+        b2.metric("Vol. Venta", "" if np.isnan(clean_num(underlying_book.get("Vol. Venta"))) else f"{underlying_book['Vol. Venta']:,.0f}")
+        b3.metric("Volumen operado", "" if np.isnan(clean_num(underlying_book.get("Volumen"))) else f"{underlying_book['Volumen']:,.0f}")
+        st.caption("Vol. Compra/Venta: suma de la cantidad ofrecida en todos los niveles de puntas que devuelve IOL para el papel (no de las opciones). Volumen operado: nominales operados en el día.")
+
+    with st.expander("🔎 Cruzar con otra fuente (BYMA / PyOBD, experimental)", expanded=False):
+        st.caption("Segunda fuente independiente de IOL para el papel (no cubre opciones). Usa datos abiertos de BYMA sin cuenta de broker. No pude validar el formato exacto de respuesta desde acá -- si algo no aparece, mandame lo que se ve en 'Ver respuesta cruda' para ajustar el parseo.")
+        if st.button("Traer cotización BYMA (PyOBD)"):
+            byma_raw = get_secondary_quote_byma(TICKERS[activo]["local"])
+            st.session_state["byma_secondary_raw"] = byma_raw
+            st.rerun()
+        byma_raw = st.session_state.get("byma_secondary_raw")
+        if byma_raw is None:
+            st.info("Todavía no trajiste datos de BYMA, o la librería PyOBD no está disponible/instalada.")
+        else:
+            byma_fields = parse_byma_secondary_fields(byma_raw)
+            cb1, cb2, cb3 = st.columns(3)
+            cb1.metric("Compra (BYMA)", "" if np.isnan(clean_num(byma_fields.get("Compra (BYMA)"))) else f"{byma_fields['Compra (BYMA)']:,.2f}")
+            cb2.metric("Venta (BYMA)", "" if np.isnan(clean_num(byma_fields.get("Venta (BYMA)"))) else f"{byma_fields['Venta (BYMA)']:,.2f}")
+            cb3.metric("Último (BYMA)", "" if np.isnan(clean_num(byma_fields.get("Último (BYMA)"))) else f"{byma_fields['Último (BYMA)']:,.2f}")
+            cb4, cb5, cb6 = st.columns(3)
+            cb4.metric("Vol. Compra (BYMA)", "" if np.isnan(clean_num(byma_fields.get("Vol. Compra (BYMA)"))) else f"{byma_fields['Vol. Compra (BYMA)']:,.0f}")
+            cb5.metric("Vol. Venta (BYMA)", "" if np.isnan(clean_num(byma_fields.get("Vol. Venta (BYMA)"))) else f"{byma_fields['Vol. Venta (BYMA)']:,.0f}")
+            cb6.metric("Volumen (BYMA)", "" if np.isnan(clean_num(byma_fields.get("Volumen (BYMA)"))) else f"{byma_fields['Volumen (BYMA)']:,.0f}")
+            with st.expander("Ver respuesta cruda de PyOBD"):
+                st.json(byma_raw)
 
     if not analyzed.empty:
         st.write("### Top oportunidades")
@@ -2449,131 +2723,6 @@ with tabs[4]:
 
 
 with tabs[5]:
-    st.subheader("Payoff manual")
-    st.caption("Simulador manual de payoff. Para recomendaciones usá Advisor.")
-
-    strategy_name = st.selectbox("Estrategia", list(STRATEGIES.keys()))
-    st.info(STRATEGIES[strategy_name])
-
-    legs = []
-    base_strike = float(round(S / 100) * 100)
-
-    if strategy_name == "Call comprado":
-        K = st.number_input("Strike", value=base_strike, step=100.0)
-        p = st.number_input("Prima pagada", value=100.0, step=1.0)
-        legs = [("buy", "call", K, p, 1)]
-
-    elif strategy_name == "Put comprado":
-        K = st.number_input("Strike", value=base_strike, step=100.0)
-        p = st.number_input("Prima pagada", value=100.0, step=1.0)
-        legs = [("buy", "put", K, p, 1)]
-
-    elif strategy_name == "Bull Call Spread":
-        K1 = st.number_input("Strike call comprada", value=base_strike, step=100.0)
-        p1 = st.number_input("Prima call comprada", value=100.0, step=1.0)
-        K2 = st.number_input("Strike call vendida", value=base_strike + 400, step=100.0)
-        p2 = st.number_input("Prima call vendida", value=50.0, step=1.0)
-        legs = [("buy", "call", K1, p1, 1), ("sell", "call", K2, p2, 1)]
-
-    elif strategy_name == "Bear Put Spread":
-        K1 = st.number_input("Strike put comprada", value=base_strike, step=100.0)
-        p1 = st.number_input("Prima put comprada", value=100.0, step=1.0)
-        K2 = st.number_input("Strike put vendida", value=base_strike - 400, step=100.0)
-        p2 = st.number_input("Prima put vendida", value=50.0, step=1.0)
-        legs = [("buy", "put", K1, p1, 1), ("sell", "put", K2, p2, 1)]
-
-    elif strategy_name == "Straddle comprado":
-        K = st.number_input("Strike común", value=base_strike, step=100.0)
-        pc = st.number_input("Prima call", value=100.0, step=1.0)
-        pp = st.number_input("Prima put", value=100.0, step=1.0)
-        legs = [("buy", "call", K, pc, 1), ("buy", "put", K, pp, 1)]
-
-    elif strategy_name == "Strangle comprado":
-        Kc = st.number_input("Strike call", value=base_strike + 300, step=100.0)
-        pc = st.number_input("Prima call", value=80.0, step=1.0)
-        Kp = st.number_input("Strike put", value=base_strike - 300, step=100.0)
-        pp = st.number_input("Prima put", value=80.0, step=1.0)
-        legs = [("buy", "call", Kc, pc, 1), ("buy", "put", Kp, pp, 1)]
-
-    prices = np.linspace(S * 0.75, S * 1.25, 250)
-    payoff, net_cost = strategy_payoff(legs, prices)
-
-    metrics = strategy_metrics(payoff, net_cost)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Costo neto aprox.", f"{net_cost:.2f}")
-    c2.metric("Ganancia", "Ilimitada*" if metrics["unlimited_upside"] else f"{metrics['max_gain']:.2f}")
-    c3.metric("Pérdida máx. rango", f"{metrics['max_loss']:.2f}")
-    c4.metric("% pérdida sobre capital", "" if pd.isna(metrics["loss_pct"]) else f"{metrics['loss_pct']:.1f}%")
-    if metrics["unlimited_upside"]:
-        st.caption("*Ilimitada teórica: el gráfico muestra solo el rango simulado.")
-
-    prob_profit_manual, ev_manual = strategy_probability_and_ev(payoff, prices, S, T, prob.get("Mu ajustada", 0.0), hv)
-    cm1, cm2 = st.columns(2)
-    cm1.metric("Prob. éxito (según pronóstico)", "" if pd.isna(prob_profit_manual) else f"{prob_profit_manual*100:.1f}%")
-    cm2.metric("Valor esperado (según pronóstico)", "" if pd.isna(ev_manual) else f"{ev_manual:.2f}")
-    st.caption("Calculado integrando este payoff contra la distribución de precios del pronóstico vigente (misma que Sube/Baja/Lateral).")
-
-    signs = np.sign(payoff)
-    breakevens = []
-    for i in range(1, len(prices)):
-        if signs[i] == 0 or signs[i] != signs[i-1]:
-            breakevens.append(prices[i])
-    if breakevens:
-        st.caption("Break-even aprox.: " + ", ".join([f"{x:.2f}" for x in breakevens[:4]]))
-
-    figp = go.Figure()
-    figp.add_trace(go.Scatter(x=prices, y=payoff, name="Payoff", mode="lines"))
-    figp.add_hline(y=0, line_dash="dash")
-    figp.add_vline(x=S, line_dash="dot", annotation_text="Precio actual")
-    figp.update_layout(
-        template="plotly_dark",
-        height=460,
-        xaxis_title="Precio al vencimiento",
-        yaxis_title="Resultado",
-        hovermode="x unified",
-    )
-    st.plotly_chart(figp, use_container_width=True)
-
-
-with tabs[6]:
-    st.subheader("Velas")
-    if st.button("🔁 Reset vista velas"):
-        st.session_state["chart_revision"] = st.session_state.get("chart_revision", 0) + 1
-
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    ema200 = close.ewm(span=200, adjust=False).mean()
-
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=h.index, open=h["Open"], high=h["High"], low=h["Low"], close=h["Close"], name="Velas"))
-    fig.add_trace(go.Scatter(x=h.index, y=ema20, name="EMA20", line=dict(width=1.2)))
-    fig.add_trace(go.Scatter(x=h.index, y=ema50, name="EMA50", line=dict(width=1.2)))
-    fig.add_trace(go.Scatter(x=h.index, y=ema200, name="EMA200", line=dict(width=1.4)))
-    fig.update_layout(
-        height=520,
-        xaxis_rangeslider_visible=False,
-        template="plotly_dark",
-        hovermode="x unified",
-        dragmode="zoom",
-        uirevision=st.session_state.get("chart_revision", 0),
-        margin=dict(l=10, r=10, t=30, b=20),
-    )
-    fig.update_xaxes(fixedrange=False)
-    fig.update_yaxes(fixedrange=False)
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config={
-            "displayModeBar": True,
-            "scrollZoom": True,
-            "doubleClick": "reset",
-            "modeBarButtonsToAdd": ["pan2d", "zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d"],
-            "displaylogo": False,
-        },
-    )
-    st.caption("Doble clic resetea. Toolbar: zoom, pan, autoscale y reset.")
-
-with tabs[7]:
     st.subheader("Favoritos")
     favs = load_favorites()
     st.caption("Guardá tickers que querés seguir. Ejemplo: GFGC8600AG")
@@ -2593,6 +2742,114 @@ with tabs[7]:
             st.rerun()
     else:
         st.info("Todavía no hay favoritos.")
+
+    st.divider()
+    st.markdown("### Mi cartera (IOL)")
+    st.caption("Trae tus posiciones de opciones de GGAL e YPF desde IOL y sugiere Vender / Mantener / Vigilar según el pronóstico Busa AI y el veredicto técnico vigentes.")
+
+    dias_venc_cartera = st.number_input(
+        "Días a vencimiento a usar para estimar (aplica a todas las posiciones)",
+        min_value=1, max_value=365, value=int(days), step=1,
+        help="La cartera de IOL no siempre indica el vencimiento exacto por posición. Ajustá este número si tus opciones vencen en una fecha distinta a la configurada en 'Parámetros'.",
+    )
+
+    if st.button("📂 Traer mi cartera de IOL"):
+        try:
+            client = IOLClient.from_config()
+            raw_port = client.get_portfolio("argentina")
+            st.session_state["portfolio_raw"] = raw_port
+            st.session_state["portfolio_df"] = normalize_portfolio(raw_port)
+            st.rerun()
+        except (IOLAuthError, IOLApiError) as e:
+            st.error(f"Error IOL: {e}")
+        except Exception as e:
+            st.error(f"No pude traer la cartera: {e}")
+
+    port_df = st.session_state.get("portfolio_df", pd.DataFrame())
+    if port_df.empty:
+        st.info("Todavía no trajiste tu cartera, o no hay posiciones. Tocá 'Traer mi cartera de IOL'.")
+    else:
+        opciones_port = port_df[port_df.apply(is_option_position, axis=1)].copy()
+        if opciones_port.empty:
+            st.warning("Traje tu cartera pero no encontré posiciones de opciones de GGAL/YPF reconocibles (series GFGC/GFGV/YPFC/YPFV). Revisá 'Debug IOL' más abajo para ver la respuesta cruda: si tus tickers vienen con otro formato, avisame para ajustar el parseo.")
+            st.dataframe(port_df, use_container_width=True)
+        else:
+            resultados = []
+            for _, pos in opciones_port.iterrows():
+                ticker = pos["Ticker"]
+                subyacente = underlying_for_option(ticker)
+                if subyacente is None:
+                    continue
+                typ = infer_tipo(ticker)
+
+                h_pos = get_hist(TICKERS[subyacente]["local"], period)
+                if h_pos.empty:
+                    continue
+                prob_pos = prob_data(h_pos, int(horizon), lateral, int(lookback), drift_shrink, use_tilt, tilt_strength)
+                prob_pos = apply_learning_to_probabilities(prob_pos, subyacente, int(learning_window), int(learning_prior_strength))
+                S_pos = float(prob_pos["S"])
+                hv_pos = prob_pos["VH"]
+
+                rsi_pos = compute_rsi(h_pos["Close"].dropna())
+                macd_pos, macd_signal_pos, macd_hist_pos = compute_macd(h_pos["Close"].dropna())
+                sma20_pos, bb_up_pos, bb_dn_pos = compute_bollinger(h_pos["Close"].dropna())
+                ema50_pos = h_pos["Close"].dropna().ewm(span=50, adjust=False).mean()
+                adx_pos, plus_di_pos, minus_di_pos = compute_adx(h_pos["High"], h_pos["Low"], h_pos["Close"].dropna())
+                veredicto_pos, _, _, _, _ = technical_verdict(
+                    rsi_pos, macd_pos, macd_signal_pos, h_pos["Close"].dropna(), sma20_pos, ema50_pos,
+                    h_pos["Volume"] if "Volume" in h_pos.columns else None, adx_pos, plus_di_pos, minus_di_pos,
+                )
+
+                m = re.search(r"(\d{3,6})", ticker)
+                strike = clean_num(m.group(1)) if m else np.nan
+
+                T_pos = dias_venc_cartera / 365
+                theo_pos = bs_price(S_pos, strike, T_pos, r, hv_pos, typ) if not np.isnan(strike) else np.nan
+                prima_actual = clean_num(pos.get("UltimoPrecio"))
+                intrinsic_pos = max(S_pos - strike, 0) if typ == "call" else max(strike - S_pos, 0) if not np.isnan(strike) else np.nan
+                extrinsic_pos = (prima_actual - intrinsic_pos) if (not np.isnan(prima_actual) and not np.isnan(intrinsic_pos)) else np.nan
+
+                accion, score_pos, razones_pos, pnl_pct = recommend_option_action(
+                    typ, pos.get("Cantidad"), dias_venc_cartera, extrinsic_pos, prima_actual, pos.get("PPC"),
+                    prob_pos, veredicto_pos,
+                )
+
+                resultados.append({
+                    "Ticker": ticker,
+                    "Subyacente": subyacente,
+                    "Tipo": typ.upper(),
+                    "Cantidad": pos.get("Cantidad"),
+                    "PPC": pos.get("PPC"),
+                    "Último": prima_actual,
+                    "P&L %": pnl_pct,
+                    "Veredicto técnico": veredicto_pos,
+                    "Acción sugerida": accion,
+                    "Razones": " · ".join(razones_pos),
+                })
+
+            if not resultados:
+                st.warning("No pude procesar las posiciones encontradas (faltan datos de precio o strike). Revisá 'Debug IOL'.")
+            else:
+                res_df = pd.DataFrame(resultados)
+                st.dataframe(
+                    res_df.drop(columns=["Razones"]).style.format(
+                        {"PPC": "{:.2f}", "Último": "{:.2f}", "P&L %": "{:.1f}", "Cantidad": "{:.0f}"}, na_rep="",
+                    ),
+                    use_container_width=True,
+                )
+                st.markdown("#### Detalle por posición")
+                for _, r_row in res_df.iterrows():
+                    css_class = "score-good" if r_row["Acción sugerida"] == "MANTENER" else "score-bad" if r_row["Acción sugerida"] == "VENDER" else "score-mid"
+                    with st.container(border=True):
+                        st.markdown(f"**{r_row['Ticker']}** ({r_row['Subyacente']}, {r_row['Tipo']}) — <span class='{css_class}'>{r_row['Acción sugerida']}</span>", unsafe_allow_html=True)
+                        st.caption(r_row["Razones"])
+                st.caption("Recomendación basada en reglas explícitas (pronóstico Busa AI + veredicto técnico + tiempo/valor extrínseco). No es asesoramiento financiero personalizado — la decisión final es tuya.")
+
+    with st.expander("Debug IOL — Cartera", expanded=False):
+        if "portfolio_raw" in st.session_state:
+            st.json(st.session_state["portfolio_raw"])
+        else:
+            st.info("Sin respuesta cruda de cartera todavía.")
 
 with st.expander("Debug IOL", expanded=False):
     if "quote_iol" in st.session_state:
