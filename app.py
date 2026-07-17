@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.14")
-st.caption("IOL + Black-Scholes + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL con histórico de opción + Fundamentals ADR + segunda fuente BYMA.")
+st.title("BusaOptions Pro 9.15")
+st.caption("IOL + Black-Scholes + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL con Donchian de la prima + Fundamentals ADR + segunda fuente BYMA.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -1313,13 +1313,42 @@ def normalize_option_history(raw):
     return df
 
 
-def build_option_history_figure(hist_opt, ppc=None, ticker=""):
+def build_option_history_figure(hist_opt, ppc=None, ticker="", donchian_window=10):
+    """
+    Gráfico de la prima con Canal de Donchian (máximo/mínimo de las últimas
+    N ruedas) + media móvil simple, en vez de Bollinger.
+
+    Por qué Donchian y no Bollinger acá: Bollinger asume que el precio
+    tiende a revertir a una media -- tiene sentido para el subyacente, pero
+    NO para la prima de una opción, que tiene un decaimiento de tiempo
+    (theta) sistemático hacia el vencimiento: no "revierte" a nada, se va
+    achicando. El Canal de Donchian no asume reversión a la media: sólo
+    marca el máximo y el mínimo efectivamente tocados en la ventana, que es
+    exactamente el rango que pediste ("Min/Max de algunas ruedas").
+    """
+    donchian_high = hist_opt["High"].rolling(donchian_window, min_periods=1).max()
+    donchian_low = hist_opt["Low"].rolling(donchian_window, min_periods=1).min()
+    sma_close = hist_opt["Close"].rolling(donchian_window, min_periods=1).mean()
+
     fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hist_opt.index, y=donchian_high, name=f"Máx. {donchian_window}r", line=dict(color=TA_THEME["band"], width=1, dash="dot"),
+        hovertemplate="Máx %d ruedas: %%{y:,.2f}<extra></extra>" % donchian_window,
+    ))
+    fig.add_trace(go.Scatter(
+        x=hist_opt.index, y=donchian_low, name=f"Mín. {donchian_window}r", line=dict(color=TA_THEME["band"], width=1, dash="dot"),
+        fill="tonexty", fillcolor=TA_THEME["band_fill"],
+        hovertemplate="Mín %d ruedas: %%{y:,.2f}<extra></extra>" % donchian_window,
+    ))
     fig.add_trace(go.Candlestick(
         x=hist_opt.index, open=hist_opt["Open"], high=hist_opt["High"],
         low=hist_opt["Low"], close=hist_opt["Close"], name="Prima",
         increasing=dict(line=dict(color=TA_THEME["up"]), fillcolor=TA_THEME["up"]),
         decreasing=dict(line=dict(color=TA_THEME["down"]), fillcolor=TA_THEME["down"]),
+    ))
+    fig.add_trace(go.Scatter(
+        x=hist_opt.index, y=sma_close, name=f"SMA {donchian_window}r", line=dict(color=TA_THEME["ema20"], width=1.4),
+        hovertemplate="SMA: %{y:,.2f}<extra></extra>",
     ))
     if ppc is not None and not np.isnan(ppc):
         fig.add_hline(
@@ -1329,7 +1358,28 @@ def build_option_history_figure(hist_opt, ppc=None, ticker=""):
         )
     fig.update_layout(xaxis_rangeslider_visible=False)
     fig.update_yaxes(tickformat=",.0f")
-    return _finalize_layout(fig, 380, f"Histórico de la prima — {ticker}", "Prima (ARS)")
+    return _finalize_layout(fig, 380, f"Histórico de la prima — {ticker} (Donchian {donchian_window}r + SMA)", "Prima (ARS)")
+
+
+def option_history_stats(hist_opt):
+    """Estadísticas simples del período traído: extremos tocados y dónde está el precio actual respecto de ellos."""
+    if hist_opt is None or hist_opt.empty:
+        return {}
+    maximo = float(hist_opt["High"].max())
+    minimo = float(hist_opt["Low"].min())
+    ultimo = float(hist_opt["Close"].iloc[-1])
+    rango = maximo - minimo
+    pos_en_rango = (ultimo - minimo) / rango if rango > 0 else np.nan
+    return {
+        "maximo": maximo,
+        "minimo": minimo,
+        "ultimo": ultimo,
+        "rango_pct": (rango / minimo * 100) if minimo > 0 else np.nan,
+        "desde_maximo_pct": (ultimo / maximo - 1) * 100 if maximo > 0 else np.nan,
+        "desde_minimo_pct": (ultimo / minimo - 1) * 100 if minimo > 0 else np.nan,
+        "pos_en_rango_pct": pos_en_rango * 100 if not np.isnan(pos_en_rango) else np.nan,
+        "n_ruedas": len(hist_opt),
+    }
 
 
 def normalize_portfolio(raw):
@@ -3079,6 +3129,11 @@ with tabs[5]:
     st.caption("Trae tus posiciones de opciones de GGAL e YPF desde IOL y sugiere Vender / Mantener / Vigilar según el pronóstico Busa AI y el veredicto técnico vigentes.")
     st.caption("El vencimiento de cada posición se calcula solo, a partir del ticker. Si alguno no se puede interpretar, cae al respaldo configurado en 'Parámetros' de la barra lateral.")
 
+    donchian_window_cartera = st.slider(
+        "Ventana para Máx./Mín. de la prima (ruedas)", 5, 30, 10, 1,
+        help="Canal de Donchian: marca el máximo y el mínimo efectivamente tocados por la prima en las últimas N ruedas, más una media móvil simple de esa misma ventana.",
+    )
+
     if st.button("📂 Traer mi cartera de IOL"):
         try:
             client = IOLClient.from_config()
@@ -3308,9 +3363,19 @@ with tabs[5]:
                             hist_opt_pos = extra.get("hist_opt", pd.DataFrame())
                             if hist_opt_pos is not None and not hist_opt_pos.empty:
                                 st.markdown("**Bandas de precio de la opción (histórico propio, no el del subyacente)**")
+                                stats_opt = option_history_stats(hist_opt_pos)
+                                if stats_opt:
+                                    s1, s2, s3, s4 = st.columns(4)
+                                    s1.metric(f"Máximo ({stats_opt['n_ruedas']}r)", f"{stats_opt['maximo']:,.2f}")
+                                    s2.metric(f"Mínimo ({stats_opt['n_ruedas']}r)", f"{stats_opt['minimo']:,.2f}")
+                                    s3.metric("Desde el máximo", "" if pd.isna(stats_opt["desde_maximo_pct"]) else f"{stats_opt['desde_maximo_pct']:.1f}%")
+                                    s4.metric("Posición en el rango", "" if pd.isna(stats_opt["pos_en_rango_pct"]) else f"{stats_opt['pos_en_rango_pct']:.0f}%")
+                                    st.caption("'Posición en el rango': 0% = tocando el mínimo del período, 100% = tocando el máximo.")
                                 ppc_val = r_row["PPC"] if not pd.isna(r_row["PPC"]) else None
-                                st.plotly_chart(build_option_history_figure(hist_opt_pos, ppc_val, ticker), use_container_width=True, config={"displaylogo": False})
-                                st.caption("Línea punteada: tu PPC (precio promedio de compra), para ver dónde quedó respecto del recorrido de la opción.")
+                                st.plotly_chart(build_option_history_figure(hist_opt_pos, ppc_val, ticker, donchian_window_cartera), use_container_width=True, config={"displaylogo": False})
+                                st.caption("Línea punteada amarilla: tu PPC. Banda gris: Canal de Donchian (máx./mín. de la ventana elegida arriba) — no es Bollinger porque la prima de una opción decae con el tiempo (theta) y no revierte a una media, a diferencia del subyacente.")
+                                if "Volume" in hist_opt_pos.columns and hist_opt_pos["Volume"].notna().any():
+                                    st.plotly_chart(build_volume_figure(hist_opt_pos, ticker), use_container_width=True, config={"displaylogo": False})
                             else:
                                 st.caption("No pude traer el histórico de precio de esta opción puntual (dato experimental, recién conectado -- revisá 'Debug IOL — Histórico de opciones' más abajo si esperabas verlo).")
 
