@@ -99,7 +99,7 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.17")
+st.title("BusaOptions Pro 9.18")
 st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL con riesgo por vencimiento + Fundamentals ADR.")
 
 TICKERS = {
@@ -3395,7 +3395,12 @@ with tabs[5]:
                 hist_opt_raw = None
                 if client_pos is not None:
                     try:
-                        fecha_hasta_str = datetime.now().strftime("%Y-%m-%d")
+                        # +1 día sobre hoy: algunos endpoints de series históricas
+                        # tratan el límite superior como exclusivo, lo que haría
+                        # que la rueda de hoy nunca aparezca aunque ya esté
+                        # disponible. Pedir un día de más es inofensivo (si ese
+                        # día no existe todavía, simplemente no viene nada para él).
+                        fecha_hasta_str = (datetime.now() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
                         fecha_desde_str = (datetime.now() - pd.Timedelta(days=200)).strftime("%Y-%m-%d")
                         hist_opt_raw = client_pos.get_history(ticker, fecha_desde_str, fecha_hasta_str)
                         hist_opt = normalize_option_history(hist_opt_raw)
