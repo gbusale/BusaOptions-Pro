@@ -99,12 +99,12 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.12")
-st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL con análisis completo + segunda fuente BYMA.")
+st.title("BusaOptions Pro 9.13")
+st.caption("IOL + Black-Scholes + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL + Fundamentals ADR + segunda fuente BYMA.")
 
 TICKERS = {
-    "GGAL": {"local": "GGAL.BA", "iol": "GGAL"},
-    "YPF": {"local": "YPFD.BA", "iol": "YPFD"},
+    "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
+    "YPF": {"local": "YPFD.BA", "iol": "YPFD", "adr": "YPF"},
 }
 
 USAGE_FILE = Path("data/iol_api_usage.json")
@@ -738,6 +738,55 @@ def get_hist(ticker, period):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df.dropna()
+
+@st.cache_data(ttl=3600 * 12, show_spinner=False)
+def get_fundamentals(ticker_adr):
+    """
+    Datos fundamentales del ADR (la acción cotizando en el exterior, en
+    USD -- NASDAQ para GGAL, NYSE para YPF). Se cachea 12 horas porque los
+    fundamentales casi no cambian en el día; el botón de la UI fuerza un
+    refresco manual igual (limpia el caché de esta función puntual).
+    """
+    try:
+        info = yf.Ticker(ticker_adr).info
+        return info if isinstance(info, dict) else {}
+    except Exception:
+        return {}
+
+def extract_fundamentals(info):
+    """Extracción defensiva de los campos de yfinance que más importan para un vistazo fundamental rápido."""
+    if not isinstance(info, dict) or not info:
+        return {}
+
+    def g(*keys):
+        for k in keys:
+            v = info.get(k)
+            if v is not None:
+                return v
+        return None
+
+    return {
+        "Precio ADR (USD)": g("currentPrice", "regularMarketPrice"),
+        "Variación día %": g("regularMarketChangePercent"),
+        "Apertura": g("regularMarketOpen", "open"),
+        "Máximo día": g("dayHigh", "regularMarketDayHigh"),
+        "Mínimo día": g("dayLow", "regularMarketDayLow"),
+        "Máx. 52 sem.": g("fiftyTwoWeekHigh"),
+        "Mín. 52 sem.": g("fiftyTwoWeekLow"),
+        "Market Cap (USD)": g("marketCap"),
+        "P/E (trailing)": g("trailingPE"),
+        "P/E (forward)": g("forwardPE"),
+        "P/B": g("priceToBook"),
+        "Dividend Yield %": g("dividendYield"),
+        "ROE %": g("returnOnEquity"),
+        "Margen neto %": g("profitMargins"),
+        "Beta": g("beta"),
+        "EPS (TTM, USD)": g("trailingEps"),
+        "Ingresos TTM (USD)": g("totalRevenue"),
+        "Precio objetivo analistas (USD)": g("targetMeanPrice"),
+        "Recomendación analistas": g("recommendationKey"),
+        "Cantidad analistas": g("numberOfAnalystOpinions"),
+    }
 
 def clean_num(x):
     if x is None or pd.isna(x):
@@ -2907,14 +2956,67 @@ with tabs[5]:
         st.info("Todavía no hay favoritos.")
 
     st.divider()
+    st.markdown("### Análisis fundamental y ADR (exterior)")
+    st.caption("Datos fundamentales y cotización del ADR (la acción cotizando afuera, en USD: NASDAQ para GGAL, NYSE para YPF). Se actualiza una vez por día automáticamente; el botón fuerza un refresco al toque.")
+
+    fund_ticker_choice = st.selectbox("Activo para el análisis fundamental", ["GGAL", "YPF"], key="fund_ticker_choice")
+
+    if st.button("🔄 Actualizar análisis fundamental"):
+        get_fundamentals.clear()
+        st.session_state["fundamentals_updated"] = {}
+
+    adr_ticker = TICKERS[fund_ticker_choice]["adr"]
+    info_fund = get_fundamentals(adr_ticker)
+    fund = extract_fundamentals(info_fund)
+
+    if not fund or fund.get("Precio ADR (USD)") is None:
+        st.warning("No pude traer datos fundamentales de Yahoo Finance para este ticker en este momento. Puede ser un corte temporal del proveedor -- probá 'Actualizar' en un rato.")
+    else:
+        ultima_act = st.session_state.get("fundamentals_updated", {}).get(fund_ticker_choice)
+        if ultima_act is None:
+            ultima_act = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            st.session_state.setdefault("fundamentals_updated", {})[fund_ticker_choice] = ultima_act
+        st.caption(f"🕒 Datos al: {ultima_act} hs. (caché de hasta 12hs; usá el botón para forzar un refresco)")
+
+        st.markdown(f"##### {fund_ticker_choice} ADR ({adr_ticker}) — cómo está la acción en el exterior")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Precio ADR (USD)", "" if fund["Precio ADR (USD)"] is None else f"US$ {fund['Precio ADR (USD)']:.2f}")
+        p2.metric("Variación día", "" if fund["Variación día %"] is None else f"{fund['Variación día %']:.2f}%")
+        p3.metric("Máx. 52 sem.", "" if fund["Máx. 52 sem."] is None else f"US$ {fund['Máx. 52 sem.']:.2f}")
+        p4.metric("Mín. 52 sem.", "" if fund["Mín. 52 sem."] is None else f"US$ {fund['Mín. 52 sem.']:.2f}")
+
+        st.markdown("##### Fundamentales")
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Market Cap (USD)", "" if fund["Market Cap (USD)"] is None else f"{fund['Market Cap (USD)']/1e9:.2f}B")
+        f2.metric("P/E (trailing)", "" if fund["P/E (trailing)"] is None else f"{fund['P/E (trailing)']:.1f}")
+        f3.metric("P/E (forward)", "" if fund["P/E (forward)"] is None else f"{fund['P/E (forward)']:.1f}")
+        f4.metric("P/B", "" if fund["P/B"] is None else f"{fund['P/B']:.2f}")
+
+        f5, f6, f7, f8 = st.columns(4)
+        f5.metric("Dividend Yield", "" if fund["Dividend Yield %"] is None else f"{fund['Dividend Yield %']*100:.2f}%")
+        f6.metric("ROE", "" if fund["ROE %"] is None else f"{fund['ROE %']*100:.1f}%")
+        f7.metric("Margen neto", "" if fund["Margen neto %"] is None else f"{fund['Margen neto %']*100:.1f}%")
+        f8.metric("Beta", "" if fund["Beta"] is None else f"{fund['Beta']:.2f}")
+
+        f9, f10 = st.columns(2)
+        f9.metric("EPS (TTM, USD)", "" if fund["EPS (TTM, USD)"] is None else f"{fund['EPS (TTM, USD)']:.2f}")
+        f10.metric("Ingresos TTM (USD)", "" if fund["Ingresos TTM (USD)"] is None else f"{fund['Ingresos TTM (USD)']/1e9:.2f}B")
+
+        st.markdown("##### Analistas (Wall Street)")
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Precio objetivo prom.", "" if fund["Precio objetivo analistas (USD)"] is None else f"US$ {fund['Precio objetivo analistas (USD)']:.2f}")
+        a2.metric("Recomendación", fund["Recomendación analistas"] or "")
+        a3.metric("Cantidad de analistas", fund["Cantidad analistas"] or "")
+        if fund["Precio objetivo analistas (USD)"] is not None and fund["Precio ADR (USD)"] is not None and fund["Precio ADR (USD)"] > 0:
+            upside = (fund["Precio objetivo analistas (USD)"] / fund["Precio ADR (USD)"] - 1) * 100
+            st.caption(f"El precio objetivo promedio de los analistas implica un {'potencial alcista' if upside >= 0 else 'potencial bajista'} de {abs(upside):.1f}% respecto del precio actual del ADR.")
+
+        st.caption("Fuente: Yahoo Finance (ADR). Los fundamentales de la especie local en BYMA no suelen estar disponibles ahí, por eso se usa el ADR como referencia. Esto es información, no una recomendación de inversión.")
+
+    st.divider()
     st.markdown("### Mi cartera (IOL)")
     st.caption("Trae tus posiciones de opciones de GGAL e YPF desde IOL y sugiere Vender / Mantener / Vigilar según el pronóstico Busa AI y el veredicto técnico vigentes.")
-
-    dias_venc_cartera = st.number_input(
-        "Días a vencimiento (respaldo, sólo si un ticker no se puede interpretar)",
-        min_value=1, max_value=365, value=int(days), step=1,
-        help="Cada posición ahora calcula su propio vencimiento automáticamente a partir del ticker (tercer viernes del mes que indican sus 2 últimas letras). Este número sólo se usa como respaldo si algún ticker no se puede interpretar.",
-    )
+    st.caption("El vencimiento de cada posición se calcula solo, a partir del ticker. Si alguno no se puede interpretar, cae al respaldo configurado en 'Parámetros' de la barra lateral.")
 
     if st.button("📂 Traer mi cartera de IOL"):
         try:
@@ -2980,7 +3082,7 @@ with tabs[5]:
                 # cae al respaldo manual.
                 fecha_venc_pos, dias_venc_pos, fuente_venc_pos = parse_option_expiry(ticker)
                 if fecha_venc_pos is None:
-                    dias_venc_pos = dias_venc_cartera
+                    dias_venc_pos = days
                     fuente_venc_pos = "manual"
                 T_pos = max(dias_venc_pos, 1) / 365
 
