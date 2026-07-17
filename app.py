@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.15")
-st.caption("IOL + Black-Scholes + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL con Donchian de la prima + Fundamentals ADR + segunda fuente BYMA.")
+st.title("BusaOptions Pro 9.16")
+st.caption("IOL + Black-Scholes + Busa AI + Advisor + Learning bayesiano + Análisis técnico con datos de hoy en vivo + Cartera IOL + Fundamentals ADR + segunda fuente BYMA.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -981,6 +981,19 @@ def extract_option_quote_fields(raw_quote):
         or raw_quote.get("volumenNominal")
     )
 
+    apertura = clean_num(cot.get("apertura") or raw_quote.get("apertura"))
+    maximo = clean_num(cot.get("maximo") or raw_quote.get("maximo"))
+    minimo = clean_num(cot.get("minimo") or raw_quote.get("minimo"))
+    variacion = clean_num(
+        cot.get("variacionPorcentual")
+        or cot.get("variacion")
+        or raw_quote.get("variacionPorcentual")
+        or raw_quote.get("variacion")
+    )
+    cierre_anterior = clean_num(cot.get("cierreAnterior") or raw_quote.get("cierreAnterior"))
+    if np.isnan(variacion) and not np.isnan(ultimo) and not np.isnan(cierre_anterior) and cierre_anterior != 0:
+        variacion = (ultimo / cierre_anterior - 1) * 100
+
     return {
         "Compra": compra,
         "Venta": venta,
@@ -988,6 +1001,10 @@ def extract_option_quote_fields(raw_quote):
         "Vol. Venta": vol_venta,
         "Último": ultimo,
         "Volumen": volumen,
+        "Apertura": apertura,
+        "Máximo": maximo,
+        "Mínimo": minimo,
+        "Variación %": variacion,
     }
 
 def merge_top_quotes_into_options(options_df, quotes_by_ticker):
@@ -2101,6 +2118,75 @@ def render_technical_panel(ticker_key, activo_seleccionado, period, horizon, lat
         generado = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         ultimo_dato = pd.to_datetime(close_series.index[-1]).strftime("%d/%m/%Y")
         st.caption(f"🕒 Predicción generada: {generado} hs. | Datos de precio hasta: {ultimo_dato} | Fuente del precio: {fuente_precio} | Horizonte: {int(horizon)} ruedas.")
+
+    # --- Hoy en vivo (IOL): el gráfico de abajo es de cierres diarios (yfinance)
+    # y por diseño no incluye la rueda de hoy hasta que cierra. Esto sí trae
+    # el dato de la rueda de hoy en curso, directo de IOL. ---
+    with st.container(border=True):
+        st.markdown(f"##### Hoy en vivo (IOL) — {ticker_key}")
+        quote_hoy = None
+        if ticker_key == activo_seleccionado and "quote_iol" in st.session_state:
+            quote_hoy = st.session_state["quote_iol"]
+        else:
+            try:
+                client_hoy = IOLClient.from_config()
+                quote_hoy = client_hoy.get_quote(TICKERS[ticker_key]["iol"])
+            except Exception:
+                quote_hoy = None
+
+        campos_hoy = extract_option_quote_fields(quote_hoy) if quote_hoy else {}
+        if not campos_hoy or (np.isnan(clean_num(campos_hoy.get("Último"))) and np.isnan(clean_num(campos_hoy.get("Volumen")))):
+            st.info("No pude traer la cotización en vivo de hoy (puede ser que el mercado esté cerrado o falte autenticación IOL).")
+        else:
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Último", "" if pd.isna(clean_num(campos_hoy.get("Último"))) else f"{campos_hoy['Último']:,.2f}")
+            h2.metric("Variación", "" if pd.isna(clean_num(campos_hoy.get("Variación %"))) else f"{campos_hoy['Variación %']:.2f}%")
+            h3.metric("Apertura", "" if pd.isna(clean_num(campos_hoy.get("Apertura"))) else f"{campos_hoy['Apertura']:,.2f}")
+            h4.metric("Máx. / Mín. día", "" if pd.isna(clean_num(campos_hoy.get("Máximo"))) else f"{campos_hoy['Máximo']:,.2f} / {campos_hoy.get('Mínimo', float('nan')):,.2f}")
+            h5, h6, h7 = st.columns(3)
+            h5.metric("Volumen operado hoy", "" if pd.isna(clean_num(campos_hoy.get("Volumen"))) else f"{campos_hoy['Volumen']:,.0f}")
+            h6.metric("Vol. Compra (puntas)", "" if pd.isna(clean_num(campos_hoy.get("Vol. Compra"))) else f"{campos_hoy['Vol. Compra']:,.0f}")
+            h7.metric("Vol. Venta (puntas)", "" if pd.isna(clean_num(campos_hoy.get("Vol. Venta"))) else f"{campos_hoy['Vol. Venta']:,.0f}")
+            st.caption(f"🕒 Consultado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} hs. 'Vol. Compra/Venta' es la cantidad ofrecida en las puntas ahora mismo, no un desglose de operaciones ejecutadas por comprador/vendedor (IOL no expone esa apertura).")
+
+        # Opciones de este subyacente que estén en la cartera ya cargada
+        # (Favoritos → Mi cartera IOL), con su volumen en vivo.
+        port_df_tech = st.session_state.get("portfolio_df", pd.DataFrame())
+        if not port_df_tech.empty:
+            opciones_cartera_tech = port_df_tech[port_df_tech.apply(is_option_position, axis=1)].copy()
+            opciones_cartera_tech = opciones_cartera_tech[opciones_cartera_tech["Ticker"].apply(underlying_for_option) == ticker_key]
+            if not opciones_cartera_tech.empty:
+                st.markdown(f"**Tus opciones de {ticker_key} en cartera — volumen de hoy**")
+                try:
+                    client_opts_tech = IOLClient.from_config()
+                except Exception:
+                    client_opts_tech = None
+                filas_opt_vol = []
+                for _, pos_tech in opciones_cartera_tech.iterrows():
+                    tk_tech = pos_tech["Ticker"]
+                    campos_opt_tech = {}
+                    if client_opts_tech is not None:
+                        try:
+                            campos_opt_tech = extract_option_quote_fields(client_opts_tech.get_quote(tk_tech))
+                        except Exception:
+                            campos_opt_tech = {}
+                    filas_opt_vol.append({
+                        "Ticker": tk_tech,
+                        "Último": campos_opt_tech.get("Último", np.nan),
+                        "Volumen operado hoy": campos_opt_tech.get("Volumen", np.nan),
+                        "Vol. Compra": campos_opt_tech.get("Vol. Compra", np.nan),
+                        "Vol. Venta": campos_opt_tech.get("Vol. Venta", np.nan),
+                    })
+                st.dataframe(
+                    pd.DataFrame(filas_opt_vol).style.format(
+                        {"Último": "{:.2f}", "Volumen operado hoy": "{:,.0f}", "Vol. Compra": "{:,.0f}", "Vol. Venta": "{:,.0f}"}, na_rep="",
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.caption(f"No tenés opciones de {ticker_key} cargadas en 'Mi cartera (IOL)' (pestaña Favoritos).")
+        else:
+            st.caption("Cargá tu cartera en Favoritos → 'Mi cartera (IOL)' para ver acá también el volumen de tus opciones puntuales.")
 
     # --- Veredicto técnico consolidado ---
     veredicto, score, detalle, adx_last, tendencia_fuerte = technical_verdict(
