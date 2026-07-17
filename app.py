@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.16")
-st.caption("IOL + Black-Scholes + Busa AI + Advisor + Learning bayesiano + Análisis técnico con datos de hoy en vivo + Cartera IOL + Fundamentals ADR + segunda fuente BYMA.")
+st.title("BusaOptions Pro 9.17")
+st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL con riesgo por vencimiento + Fundamentals ADR.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -1326,8 +1326,22 @@ def normalize_option_history(raw):
     if df.empty:
         return df
     df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-    df = df.dropna(subset=["fecha", "Close"]).sort_values("fecha").set_index("fecha")
-    return df
+    df = df.dropna(subset=["fecha", "Close"]).sort_values("fecha")
+
+    # IOL puede devolver más de un registro por rueda (ej. snapshots
+    # intradía). Se agrupa a UNA barra por día calendario con la regla OHLC
+    # estándar, para que "cuántas ruedas" y las bandas de máx./mín. reflejen
+    # sesiones reales, no registros sueltos.
+    df["fecha_dia"] = df["fecha"].dt.normalize()
+    agg = df.groupby("fecha_dia").agg(
+        Open=("Open", "first"),
+        High=("High", "max"),
+        Low=("Low", "min"),
+        Close=("Close", "last"),
+        Volume=("Volume", "sum"),
+    )
+    agg.index.name = "fecha"
+    return agg.sort_index()
 
 
 def build_option_history_figure(hist_opt, ppc=None, ticker="", donchian_window=10):
@@ -1349,12 +1363,13 @@ def build_option_history_figure(hist_opt, ppc=None, ticker="", donchian_window=1
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=hist_opt.index, y=donchian_high, name=f"Máx. {donchian_window}r", line=dict(color=TA_THEME["band"], width=1, dash="dot"),
+        x=hist_opt.index, y=donchian_high, name=f"Máx. {donchian_window}r",
+        line=dict(color="rgba(139,149,165,0.55)", width=1, dash="dot"),
         hovertemplate="Máx %d ruedas: %%{y:,.2f}<extra></extra>" % donchian_window,
     ))
     fig.add_trace(go.Scatter(
-        x=hist_opt.index, y=donchian_low, name=f"Mín. {donchian_window}r", line=dict(color=TA_THEME["band"], width=1, dash="dot"),
-        fill="tonexty", fillcolor=TA_THEME["band_fill"],
+        x=hist_opt.index, y=donchian_low, name=f"Mín. {donchian_window}r",
+        line=dict(color="rgba(139,149,165,0.55)", width=1, dash="dot"),
         hovertemplate="Mín %d ruedas: %%{y:,.2f}<extra></extra>" % donchian_window,
     ))
     fig.add_trace(go.Candlestick(
@@ -1378,12 +1393,19 @@ def build_option_history_figure(hist_opt, ppc=None, ticker="", donchian_window=1
     return _finalize_layout(fig, 380, f"Histórico de la prima — {ticker} (Donchian {donchian_window}r + SMA)", "Prima (ARS)")
 
 
-def option_history_stats(hist_opt):
-    """Estadísticas simples del período traído: extremos tocados y dónde está el precio actual respecto de ellos."""
+def option_history_stats(hist_opt, window=None):
+    """
+    Estadísticas del período: extremos tocados y dónde está el precio actual
+    respecto de ellos. Con 'window' se limita a las últimas N ruedas (la
+    misma ventana del Canal de Donchian), para una lectura de corto plazo de
+    cuánto margen le queda a la prima para subir o bajar más -- no todo el
+    historial desde que se emitió la serie.
+    """
     if hist_opt is None or hist_opt.empty:
         return {}
-    maximo = float(hist_opt["High"].max())
-    minimo = float(hist_opt["Low"].min())
+    d = hist_opt.tail(int(window)) if window else hist_opt
+    maximo = float(d["High"].max())
+    minimo = float(d["Low"].min())
     ultimo = float(hist_opt["Close"].iloc[-1])
     rango = maximo - minimo
     pos_en_rango = (ultimo - minimo) / rango if rango > 0 else np.nan
@@ -1395,7 +1417,7 @@ def option_history_stats(hist_opt):
         "desde_maximo_pct": (ultimo / maximo - 1) * 100 if maximo > 0 else np.nan,
         "desde_minimo_pct": (ultimo / minimo - 1) * 100 if minimo > 0 else np.nan,
         "pos_en_rango_pct": pos_en_rango * 100 if not np.isnan(pos_en_rango) else np.nan,
-        "n_ruedas": len(hist_opt),
+        "n_ruedas": len(d),
     }
 
 
@@ -1452,6 +1474,64 @@ def underlying_for_option(ticker):
     if ticker.startswith(("YPFC", "YPFV")):
         return "YPF"
     return None
+
+
+def portfolio_expiry_risk(resultados, detalles_extra):
+    """
+    Vista de riesgo de cartera por vencimiento (no por posición individual):
+    cuánto valor nocional y cuánto valor extrínseco está concentrado en qué
+    horizonte de tiempo, y cuánto se pierde/gana por día en toda la cartera
+    sólo por el paso del tiempo (theta agregado). Sirve para ver si el
+    riesgo de vencimiento está muy concentrado en pocos días, algo que mirar
+    posición por posición no siempre deja ver.
+    """
+    if not resultados:
+        return None
+
+    filas = []
+    theta_total = 0.0
+    extrinsico_total = 0.0
+    nocional_total = 0.0
+    dias_lista = []
+
+    for r in resultados:
+        ticker = r["Ticker"]
+        extra = detalles_extra.get(ticker, {})
+        cantidad = clean_num(r.get("Cantidad"))
+        ultimo = clean_num(r.get("Último"))
+        dias = clean_num(extra.get("dias_venc_pos"))
+        extrinsico = clean_num(extra.get("extrinsic_pos"))
+        theta = clean_num(extra.get("theta_pos"))
+
+        nocional = ultimo * cantidad if not np.isnan(ultimo) and not np.isnan(cantidad) else np.nan
+        if not np.isnan(nocional):
+            nocional_total += nocional
+        if not np.isnan(extrinsico) and not np.isnan(cantidad):
+            extrinsico_total += extrinsico * cantidad
+        if not np.isnan(theta) and not np.isnan(cantidad):
+            theta_total += theta * cantidad
+        if not np.isnan(dias):
+            dias_lista.append(dias)
+
+        filas.append({"dias": dias, "nocional": nocional})
+
+    dias_min = min(dias_lista) if dias_lista else np.nan
+
+    buckets = {"≤5 días": 0.0, "6-15 días": 0.0, "16-30 días": 0.0, ">30 días": 0.0}
+    for f in filas:
+        d, n = f["dias"], f["nocional"]
+        if np.isnan(d) or np.isnan(n):
+            continue
+        clave = "≤5 días" if d <= 5 else "6-15 días" if d <= 15 else "16-30 días" if d <= 30 else ">30 días"
+        buckets[clave] += abs(n)
+
+    return {
+        "nocional_total": nocional_total,
+        "extrinsico_total": extrinsico_total,
+        "theta_total": theta_total,
+        "dias_min": dias_min,
+        "buckets": buckets,
+    }
 
 
 def position_expected_value(typ, K, cantidad, prima_actual, S, T, mu, hv):
@@ -1961,17 +2041,17 @@ def _finalize_layout(fig, height, title, yaxis_title=None, show_legend=True):
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Segoe UI, Roboto, Arial, sans-serif", size=12, color=TA_THEME["text"]),
-        title=dict(text=title, font=dict(size=14, color=TA_THEME["title"]), x=0.01, xanchor="left", y=0.97),
+        title=dict(text=title, font=dict(size=14, color=TA_THEME["title"]), x=0.01, xanchor="left", y=0.99, yanchor="top"),
         height=height,
         hovermode="x unified",
         hoverlabel=dict(bgcolor="#1f2937", font_size=12, font_family="Segoe UI, Arial, sans-serif", bordercolor="rgba(255,255,255,0.1)"),
         showlegend=show_legend,
         legend=dict(
-            orientation="h", yanchor="bottom", y=1.005, x=0,
+            orientation="h", yanchor="top", y=0.88, x=0,
             bgcolor="rgba(15,23,42,0.55)", bordercolor="rgba(255,255,255,0.08)", borderwidth=1,
             font=dict(size=11),
         ),
-        margin=dict(l=10, r=55, t=42, b=25),
+        margin=dict(l=10, r=55, t=80, b=25),
     )
     return _style_axes(fig, yaxis_title)
 
@@ -3377,7 +3457,7 @@ with tabs[5]:
                     ema50_pos=ema50_pos, adx_pos=adx_pos, plus_di_pos=plus_di_pos, minus_di_pos=minus_di_pos,
                     close_pos=close_pos, volumen_pos_series=volumen_pos_series,
                     delta_pos=delta_pos, gamma_pos=gamma_pos, vega_pos=vega_pos, theta_pos=theta_pos,
-                    intrinsic_pos=intrinsic_pos, extrinsic_pos=extrinsic_pos,
+                    intrinsic_pos=intrinsic_pos, extrinsic_pos=extrinsic_pos, theo_pos=theo_pos,
                     compra_op=compra_op, venta_op=venta_op, liquidez_pos=liquidez_pos,
                     valor_esperado_mantener=valor_esperado_mantener, valor_cierre_ahora=valor_cierre_ahora,
                     hist_opt=hist_opt,
@@ -3395,6 +3475,30 @@ with tabs[5]:
                     ),
                     use_container_width=True,
                 )
+
+                st.markdown("#### Riesgo de cartera por vencimiento")
+                st.caption("Vista consolidada de toda la cartera de opciones -- no posición por posición -- para ver si el riesgo de vencimiento está concentrado en pocos días.")
+                riesgo = portfolio_expiry_risk(resultados, detalles_extra)
+                if riesgo:
+                    rc1, rc2, rc3 = st.columns(3)
+                    rc1.metric("Valor nocional total", f"{riesgo['nocional_total']:,.0f}")
+                    rc2.metric("Valor extrínseco total", f"{riesgo['extrinsico_total']:,.0f}")
+                    rc3.metric("Theta total (por día)", f"{riesgo['theta_total']:,.0f}")
+                    if not np.isnan(riesgo["dias_min"]):
+                        st.caption(f"El vencimiento más próximo de la cartera es en {int(riesgo['dias_min'])} días.")
+
+                    bucket_df = pd.DataFrame([{"Horizonte": k, "Nocional en riesgo": v} for k, v in riesgo["buckets"].items()])
+                    st.dataframe(bucket_df.style.format({"Nocional en riesgo": "{:,.0f}"}), use_container_width=True)
+
+                    total_nocional_abs = sum(abs(v) for v in riesgo["buckets"].values())
+                    if total_nocional_abs > 0:
+                        pct_corto = (riesgo["buckets"]["≤5 días"] + riesgo["buckets"]["6-15 días"]) / total_nocional_abs * 100
+                        if pct_corto > 60:
+                            st.warning(f"El {pct_corto:.0f}% del valor nocional de la cartera vence en menos de 15 días: riesgo de vencimiento concentrado en el corto plazo.")
+                        else:
+                            st.caption(f"{pct_corto:.0f}% del valor nocional vence en menos de 15 días.")
+                    st.caption("Theta total: cuánto se espera que cambie el valor conjunto de la cartera por día, sólo por el paso del tiempo, sin cambios de precio del subyacente (positivo favorece a quien vendió/lanzó, negativo a quien compró).")
+
                 st.markdown("#### Detalle por posición")
                 st.caption("Cada posición se analiza con la misma información que el resto de la app: pronóstico Busa AI, RSI/MACD/Bollinger/ADX del subyacente, griegas de la opción, liquidez puntual y una comparación de valor esperado entre mantener y cerrar ahora.")
                 for _, r_row in res_df.iterrows():
@@ -3416,13 +3520,18 @@ with tabs[5]:
                         st.caption(f"Vencimiento: {r_row['Vencimiento']} | Precio de referencia: {extra.get('fuente_precio_pos', '')}")
 
                         if extra:
-                            st.markdown("**Griegas de la posición**")
-                            g1, g2, g3, g4, g5 = st.columns(5)
+                            st.markdown("**Griegas de la posición (y Black-Scholes)**")
+                            g0, g1, g2, g3, g4, g5 = st.columns(6)
+                            theo_val = extra.get("theo_pos", np.nan)
+                            g0.metric("Black-Scholes", "" if pd.isna(theo_val) else f"{theo_val:,.2f}")
                             g1.metric("Delta", "" if pd.isna(extra.get("delta_pos", np.nan)) else f"{extra['delta_pos']:.3f}")
                             g2.metric("Gamma", "" if pd.isna(extra.get("gamma_pos", np.nan)) else f"{extra['gamma_pos']:.4f}")
                             g3.metric("Theta diario", "" if pd.isna(extra.get("theta_pos", np.nan)) else f"{extra['theta_pos']:.2f}")
                             g4.metric("Vega x1%", "" if pd.isna(extra.get("vega_pos", np.nan)) else f"{extra['vega_pos']:.2f}")
                             g5.metric("Extrínseco", "" if pd.isna(extra.get("extrinsic_pos", np.nan)) else f"{extra['extrinsic_pos']:.2f}")
+                            if not pd.isna(theo_val) and theo_val > 0 and not pd.isna(r_row["Último"]):
+                                dif_bs = (r_row["Último"] / theo_val - 1) * 100
+                                st.caption(f"Precio de mercado vs. Black-Scholes: {dif_bs:+.1f}% ({'cara' if dif_bs > 0 else 'barata'} respecto del valor teórico, según la volatilidad histórica usada).")
 
                             st.markdown(f"**Contexto técnico de {extra['subyacente']}**")
                             pp = extra["prob_pos"]
@@ -3449,7 +3558,7 @@ with tabs[5]:
                             hist_opt_pos = extra.get("hist_opt", pd.DataFrame())
                             if hist_opt_pos is not None and not hist_opt_pos.empty:
                                 st.markdown("**Bandas de precio de la opción (histórico propio, no el del subyacente)**")
-                                stats_opt = option_history_stats(hist_opt_pos)
+                                stats_opt = option_history_stats(hist_opt_pos, donchian_window_cartera)
                                 if stats_opt:
                                     s1, s2, s3, s4 = st.columns(4)
                                     s1.metric(f"Máximo ({stats_opt['n_ruedas']}r)", f"{stats_opt['maximo']:,.2f}")
@@ -3459,7 +3568,7 @@ with tabs[5]:
                                     st.caption("'Posición en el rango': 0% = tocando el mínimo del período, 100% = tocando el máximo.")
                                 ppc_val = r_row["PPC"] if not pd.isna(r_row["PPC"]) else None
                                 st.plotly_chart(build_option_history_figure(hist_opt_pos, ppc_val, ticker, donchian_window_cartera), use_container_width=True, config={"displaylogo": False})
-                                st.caption("Línea punteada amarilla: tu PPC. Banda gris: Canal de Donchian (máx./mín. de la ventana elegida arriba) — no es Bollinger porque la prima de una opción decae con el tiempo (theta) y no revierte a una media, a diferencia del subyacente.")
+                                st.caption("Línea punteada amarilla: tu PPC. Líneas grises finas: Canal de Donchian (máx./mín. de la ventana elegida arriba) — no es Bollinger porque la prima de una opción decae con el tiempo (theta) y no revierte a una media, a diferencia del subyacente.")
                                 if "Volume" in hist_opt_pos.columns and hist_opt_pos["Volume"].notna().any():
                                     st.plotly_chart(build_volume_figure(hist_opt_pos, ticker), use_container_width=True, config={"displaylogo": False})
                             else:
