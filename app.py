@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.13")
-st.caption("IOL + Black-Scholes + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL + Fundamentals ADR + segunda fuente BYMA.")
+st.title("BusaOptions Pro 9.14")
+st.caption("IOL + Black-Scholes + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL con histórico de opción + Fundamentals ADR + segunda fuente BYMA.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -1269,6 +1269,67 @@ def normalize_options(raw):
         })
     df = pd.DataFrame(rows)
     return df.dropna(subset=["Strike"]).sort_values(["Tipo", "Strike", "Ticker"]) if not df.empty else df
+
+
+def normalize_option_history(raw):
+    """
+    Parsea la serie histórica de UNA opción puntual (client.get_history),
+    para mostrar las bandas de precio (máximo/mínimo/apertura/cierre) de esa
+    opción a lo largo del tiempo -- no del subyacente.
+
+    El schema exacto de esta respuesta de IOL no está confirmado acá (nunca
+    se había conectado esta llamada a una pantalla), así que se prueban
+    varios nombres de campo habituales, de forma defensiva -- igual que el
+    resto de los parsers de este archivo. Si no matchea, revisar la
+    respuesta cruda en el expander "Debug IOL — Histórico de opción".
+    """
+    if isinstance(raw, dict):
+        for key in ["data", "result", "items", "cotizaciones", "serieHistorica", "titulos"]:
+            if isinstance(raw.get(key), list):
+                raw = raw[key]
+                break
+    if not isinstance(raw, list):
+        return pd.DataFrame()
+
+    rows = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        fecha = item.get("fechaHora") or item.get("fecha") or item.get("fechaCotizacion")
+        if fecha is None:
+            continue
+        apertura = clean_num(item.get("apertura") or item.get("precioApertura") or item.get("open"))
+        maximo = clean_num(item.get("maximo") or item.get("precioMaximo") or item.get("max") or item.get("high"))
+        minimo = clean_num(item.get("minimo") or item.get("precioMinimo") or item.get("min") or item.get("low"))
+        cierre = clean_num(item.get("ultimoPrecio") or item.get("cierre") or item.get("precioCierre") or item.get("close"))
+        volumen = clean_num(item.get("volumen") or item.get("volumenNominal") or item.get("volume"))
+        rows.append({"fecha": fecha, "Open": apertura, "High": maximo, "Low": minimo, "Close": cierre, "Volume": volumen})
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df = df.dropna(subset=["fecha", "Close"]).sort_values("fecha").set_index("fecha")
+    return df
+
+
+def build_option_history_figure(hist_opt, ppc=None, ticker=""):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=hist_opt.index, open=hist_opt["Open"], high=hist_opt["High"],
+        low=hist_opt["Low"], close=hist_opt["Close"], name="Prima",
+        increasing=dict(line=dict(color=TA_THEME["up"]), fillcolor=TA_THEME["up"]),
+        decreasing=dict(line=dict(color=TA_THEME["down"]), fillcolor=TA_THEME["down"]),
+    ))
+    if ppc is not None and not np.isnan(ppc):
+        fig.add_hline(
+            y=ppc, line_dash="dot", line_width=1.4, line_color="#f0b90b",
+            annotation_text=f"PPC {ppc:,.2f}", annotation_position="right",
+            annotation_font=dict(size=11, color="#f0b90b"), annotation_bgcolor="rgba(15,23,42,0.75)",
+        )
+    fig.update_layout(xaxis_rangeslider_visible=False)
+    fig.update_yaxes(tickformat=",.0f")
+    return _finalize_layout(fig, 380, f"Histórico de la prima — {ticker}", "Prima (ARS)")
 
 
 def normalize_portfolio(raw):
@@ -3107,6 +3168,19 @@ with tabs[5]:
                     prima_actual = clean_num(pos.get("UltimoPrecio"))
                     fuente_precio_pos = "cartera IOL (puede estar desactualizado)"
 
+                # Histórico de precio de ESTA opción puntual (bandas de
+                # máximo/mínimo/apertura/cierre por rueda), no del subyacente.
+                hist_opt = pd.DataFrame()
+                hist_opt_raw = None
+                if client_pos is not None:
+                    try:
+                        fecha_hasta_str = datetime.now().strftime("%Y-%m-%d")
+                        fecha_desde_str = (datetime.now() - pd.Timedelta(days=200)).strftime("%Y-%m-%d")
+                        hist_opt_raw = client_pos.get_history(ticker, fecha_desde_str, fecha_hasta_str)
+                        hist_opt = normalize_option_history(hist_opt_raw)
+                    except Exception:
+                        hist_opt = pd.DataFrame()
+
                 theo_pos = bs_price(S_pos, strike, T_pos, r, hv_pos, typ) if not np.isnan(strike) else np.nan
                 iv_pos = implied_vol(prima_actual, S_pos, strike, T_pos, r, typ) if (not np.isnan(prima_actual) and not np.isnan(strike)) else np.nan
                 sig_pos = iv_pos if not np.isnan(iv_pos) else hv_pos
@@ -3165,7 +3239,10 @@ with tabs[5]:
                     intrinsic_pos=intrinsic_pos, extrinsic_pos=extrinsic_pos,
                     compra_op=compra_op, venta_op=venta_op, liquidez_pos=liquidez_pos,
                     valor_esperado_mantener=valor_esperado_mantener, valor_cierre_ahora=valor_cierre_ahora,
+                    hist_opt=hist_opt,
                 )
+                if hist_opt_raw is not None:
+                    st.session_state.setdefault("hist_opt_raw_debug", {})[ticker] = hist_opt_raw
 
             if not resultados:
                 st.warning("No pude procesar las posiciones encontradas (faltan datos de precio o strike). Revisá 'Debug IOL'.")
@@ -3228,6 +3305,15 @@ with tabs[5]:
                                 liq_txt += f" | Compra {extra['compra_op']:.2f} / Venta {extra['venta_op']:.2f}"
                             st.caption(liq_txt)
 
+                            hist_opt_pos = extra.get("hist_opt", pd.DataFrame())
+                            if hist_opt_pos is not None and not hist_opt_pos.empty:
+                                st.markdown("**Bandas de precio de la opción (histórico propio, no el del subyacente)**")
+                                ppc_val = r_row["PPC"] if not pd.isna(r_row["PPC"]) else None
+                                st.plotly_chart(build_option_history_figure(hist_opt_pos, ppc_val, ticker), use_container_width=True, config={"displaylogo": False})
+                                st.caption("Línea punteada: tu PPC (precio promedio de compra), para ver dónde quedó respecto del recorrido de la opción.")
+                            else:
+                                st.caption("No pude traer el histórico de precio de esta opción puntual (dato experimental, recién conectado -- revisá 'Debug IOL — Histórico de opciones' más abajo si esperabas verlo).")
+
                         st.markdown("**Por qué esta recomendación**")
                         st.caption(r_row["Razones"])
 
@@ -3238,6 +3324,15 @@ with tabs[5]:
             st.json(st.session_state["portfolio_raw"])
         else:
             st.info("Sin respuesta cruda de cartera todavía.")
+
+    with st.expander("Debug IOL — Histórico de opciones", expanded=False):
+        hist_debug = st.session_state.get("hist_opt_raw_debug", {})
+        if hist_debug:
+            for tk, raw_h in hist_debug.items():
+                st.write(f"**{tk}**")
+                st.json(raw_h)
+        else:
+            st.info("Sin respuesta cruda de histórico de opciones todavía. Se completa al traer la cartera.")
 
 with st.expander("Debug IOL", expanded=False):
     if "quote_iol" in st.session_state:
