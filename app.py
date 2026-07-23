@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.18")
-st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor + Learning bayesiano + Análisis técnico + Cartera IOL con riesgo por vencimiento + Fundamentals ADR.")
+st.title("BusaOptions Pro 9.19")
+st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor con Ratio Backspreads + Learning bayesiano + Análisis técnico + Cartera IOL + Fundamentals ADR.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -2506,7 +2506,8 @@ def build_strategy_advisor(analyzed, S, prob_dict, T_expiry, mu, hv, max_loss_pc
         acciones_partes = []
         for i, leg in enumerate(legs):
             if i < len(tickers_row) and tickers_row[i]:
-                acciones_partes.append(f"T{i+1}: {accion_map.get(leg[0], leg[0])}")
+                qty_leg = leg[4] if len(leg) > 4 else 1
+                acciones_partes.append(f"T{i+1}: {accion_map.get(leg[0], leg[0])} x{qty_leg}")
         acciones_str = " · ".join(acciones_partes)
 
         ev_component = 0.0
@@ -2602,6 +2603,66 @@ def build_strategy_advisor(analyzed, S, prob_dict, T_expiry, mu, hv, max_loss_pc
                 breakeven = float(buy["Strike"]) - net
                 score_base = np.nanmean([buy["Score Busa"], sell["Score Busa"]])
                 add_row("Bear Put Spread", buy["Ticker"], sell["Ticker"], "", "", "Bajista moderado", "Limitada", legs, breakeven, score_base, "Menor costo y menor riesgo que put comprado.", T_leg=_row_T(buy, T_expiry), venc_str=venc_buy or venc_sell)
+
+    # Call Ratio Backspread (sólo entre opciones del mismo vencimiento):
+    # vender 1 call de strike más cercano y comprar 2 de strike más lejano.
+    # No es de las 6 estrategias "de manual" de arriba, pero es una
+    # combinación real y conocida que estructuralmente da pérdida acotada
+    # en la zona media + ganancia SIN TECHO si el papel sube fuerte. Se
+    # verifica el resultado calculado, no se asume por construcción.
+    if len(calls) >= 2:
+        base_calls_bs = calls[(calls["Strike"] >= S * 0.90) & (calls["Strike"] <= S * 1.05)].sort_values("Score Busa", ascending=False).head(6)
+        for _, sell in base_calls_bs.iterrows():
+            higher = calls[calls["Strike"] > sell["Strike"]].head(5)
+            for _, buy in higher.iterrows():
+                venc_sell, venc_buy = str(sell.get("Vencimiento", "")), str(buy.get("Vencimiento", ""))
+                if venc_sell and venc_buy and venc_sell != venc_buy:
+                    continue
+                p_sell = float(sell["prima_ref"]); p_buy = float(buy["prima_ref"])
+                legs = [("sell", "call", float(sell["Strike"]), p_sell, 1), ("buy", "call", float(buy["Strike"]), p_buy, 2)]
+                payoff_bs, net_cost_bs = strategy_payoff(legs, prices)
+                m_bs = strategy_metrics(payoff_bs, net_cost_bs)
+                if not m_bs["unlimited_upside"]:
+                    continue  # nos interesan sólo los que sí confirman ganancia ilimitada
+                score_base = np.nanmean([sell["Score Busa"], buy["Score Busa"]])
+                add_row(
+                    "Call Ratio Backspread (1:2)", sell["Ticker"], buy["Ticker"], "", "",
+                    "Alcista fuerte", "Ilimitada al alza",
+                    legs, np.nan, score_base,
+                    "No estándar: vendés 1 call más cercana y comprás 2 más lejanas. Pérdida acotada si el papel sube poco o queda quieto; sin techo si sube fuerte.",
+                    T_leg=_row_T(sell, T_expiry), venc_str=venc_sell or venc_buy,
+                )
+
+    # Put Ratio Backspread (mismo vencimiento): vender 1 put de strike más
+    # alto y comprar 2 de strike más bajo. Pérdida acotada en la zona media
+    # + ganancia grande (acotada por el subyacente yendo a cero, pero mucho
+    # mayor que la pérdida posible) si el papel cae fuerte.
+    if len(puts) >= 2:
+        base_puts_bs = puts[(puts["Strike"] >= S * 0.95) & (puts["Strike"] <= S * 1.10)].sort_values("Score Busa", ascending=False).head(6)
+        for _, sell in base_puts_bs.iterrows():
+            lower = puts[puts["Strike"] < sell["Strike"]].tail(5)
+            for _, buy in lower.iterrows():
+                venc_sell, venc_buy = str(sell.get("Vencimiento", "")), str(buy.get("Vencimiento", ""))
+                if venc_sell and venc_buy and venc_sell != venc_buy:
+                    continue
+                p_sell = float(sell["prima_ref"]); p_buy = float(buy["prima_ref"])
+                legs = [("sell", "put", float(sell["Strike"]), p_sell, 1), ("buy", "put", float(buy["Strike"]), p_buy, 2)]
+                payoff_bs2, net_cost_bs2 = strategy_payoff(legs, prices)
+                # Ganancia fuerte a la baja: el extremo izquierdo del rango
+                # de precios simulado debe rendir mucho más que la pérdida
+                # máxima en la zona media.
+                m_bs2 = strategy_metrics(payoff_bs2, net_cost_bs2)
+                gana_fuerte_abajo = payoff_bs2[0] > payoff_bs2[1] and payoff_bs2[0] > 2 * abs(m_bs2["max_loss"])
+                if not gana_fuerte_abajo:
+                    continue
+                score_base = np.nanmean([sell["Score Busa"], buy["Score Busa"]])
+                add_row(
+                    "Put Ratio Backspread (1:2)", sell["Ticker"], buy["Ticker"], "", "",
+                    "Bajista fuerte", "Alta a la baja",
+                    legs, np.nan, score_base,
+                    "No estándar: vendés 1 put más cercana y comprás 2 más lejanas. Pérdida acotada si el papel baja poco o queda quieto; ganancia grande si cae fuerte.",
+                    T_leg=_row_T(sell, T_expiry), venc_str=venc_sell or venc_buy,
+                )
 
     # Straddle / Strangle long for movement (sólo entre opciones del mismo vencimiento)
     if len(calls) >= 1 and len(puts) >= 1:
