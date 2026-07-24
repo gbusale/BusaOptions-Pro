@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.20")
-st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor con Ratio Backspreads + Score Busa recalibrado + Learning bayesiano + Cartera IOL + Fundamentals ADR.")
+st.title("BusaOptions Pro 9.21")
+st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor + Simulador de escenarios + Cartera IOL + Fundamentals ADR.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -1532,6 +1532,62 @@ def portfolio_expiry_risk(resultados, detalles_extra):
         "dias_min": dias_min,
         "buckets": buckets,
     }
+
+
+def build_movement_scenarios(typ, K, S, dias_restantes, r, hv, precio_referencia, checkpoints_semanas=None):
+    """
+    Grilla de escenarios: para cada semana que falta hasta el vencimiento y
+    para movimientos fijos del papel (-10/-5/-2/0/+2/+5/+10%), calcula el
+    valor teórico (Black-Scholes) resultante de la opción. También calcula,
+    para cada semana, cuánto % necesita moverse el papel para breakeven
+    (volver a 'precio_referencia') y para +10% de ganancia sobre esa
+    referencia.
+
+    'precio_referencia' es el precio contra el que se mide breakeven/gcia:
+    el PPC si es una posición real, o el precio de entrada hipotético si es
+    una simulación sin posición.
+    """
+    if dias_restantes is None or np.isnan(dias_restantes) or dias_restantes <= 0:
+        return pd.DataFrame()
+    if K is None or np.isnan(K) or S is None or np.isnan(S) or hv is None or np.isnan(hv) or hv <= 0:
+        return pd.DataFrame()
+
+    if checkpoints_semanas is None:
+        max_semanas = max(int(dias_restantes // 7), 0)
+        checkpoints_semanas = list(range(0, max_semanas + 1))
+
+    movimientos = [-0.10, -0.05, -0.02, 0.0, 0.02, 0.05, 0.10]
+    filas = []
+    for semanas in checkpoints_semanas:
+        dias_transcurridos = semanas * 7
+        dias_rest = max(dias_restantes - dias_transcurridos, 0.5)
+        T = dias_rest / 365
+        fila = {"Semana": semanas, "Días restantes": int(round(dias_rest))}
+        for mov in movimientos:
+            S_test = S * (1 + mov)
+            theo = bs_price(S_test, K, T, r, hv, typ)
+            fila[f"{mov*100:+.0f}%"] = theo
+
+        def f_be(S_test):
+            return bs_price(S_test, K, T, r, hv, typ) - precio_referencia
+        try:
+            S_be = brentq(f_be, S * 0.2, S * 5.0)
+            fila["Breakeven (mov. %)"] = (S_be / S - 1) * 100
+        except Exception:
+            fila["Breakeven (mov. %)"] = np.nan
+
+        objetivo_10 = precio_referencia * 1.10
+        def f_10(S_test):
+            return bs_price(S_test, K, T, r, hv, typ) - objetivo_10
+        try:
+            S_10 = brentq(f_10, S * 0.2, S * 5.0)
+            fila["+10% gcia (mov. %)"] = (S_10 / S - 1) * 100
+        except Exception:
+            fila["+10% gcia (mov. %)"] = np.nan
+
+        filas.append(fila)
+
+    return pd.DataFrame(filas)
 
 
 def position_expected_value(typ, K, cantidad, prima_actual, S, T, mu, hv):
@@ -3364,6 +3420,65 @@ with tabs[5]:
         st.caption("Fuente: Yahoo Finance (ADR). Los fundamentales de la especie local en BYMA no suelen estar disponibles ahí, por eso se usa el ADR como referencia. Esto es información, no una recomendación de inversión.")
 
     st.divider()
+    st.markdown("### Simulador de escenarios (sin necesidad de cartera)")
+    st.caption("Probá 'cuánto tiene que moverse el papel' para cualquier opción, tengas o no una posición real cargada. Ideal para evaluar antes de comprar.")
+
+    sim_c1, sim_c2, sim_c3 = st.columns(3)
+    sim_subyacente = sim_c1.selectbox("Subyacente", ["GGAL", "YPF"], key="sim_subyacente")
+    sim_ticker = sim_c2.text_input("Ticker de la opción", placeholder="Ej: GFGC8600AG", key="sim_ticker")
+    sim_precio_entrada = sim_c3.number_input("Precio de entrada a simular", min_value=0.01, value=100.0, step=1.0, key="sim_precio_entrada")
+
+    if st.button("🧮 Simular escenarios"):
+        tk_sim = sim_ticker.strip().upper()
+        if not tk_sim:
+            st.warning("Ingresá un ticker (ej: GFGC8600AG).")
+        else:
+            typ_sim = infer_tipo(tk_sim)
+            m_sim = re.search(r"(\d{3,6})", tk_sim)
+            strike_sim = clean_num(m_sim.group(1)) if m_sim else np.nan
+            fecha_venc_sim, dias_venc_sim, fuente_venc_sim = parse_option_expiry(tk_sim)
+            if np.isnan(strike_sim):
+                st.error("No pude interpretar el strike desde el ticker. Revisá el formato (ej: GFGC8600AG).")
+            elif fecha_venc_sim is None:
+                st.error("No pude interpretar el vencimiento desde el ticker (código de mes no reconocido).")
+            else:
+                h_sim = get_hist(TICKERS[sim_subyacente]["local"], period)
+                if h_sim.empty:
+                    st.error("No pude traer precio histórico del subyacente para esta simulación.")
+                else:
+                    prob_sim = prob_data(h_sim, int(horizon), lateral, int(lookback), drift_shrink, use_tilt, tilt_strength)
+                    prob_sim = apply_learning_to_probabilities(prob_sim, sim_subyacente, int(learning_window), int(learning_prior_strength))
+                    S_sim = float(prob_sim["S"])
+                    hv_sim = prob_sim["VH"]
+
+                    st.session_state["sim_resultado"] = dict(
+                        ticker=tk_sim, typ=typ_sim, strike=strike_sim, S=S_sim, hv=hv_sim,
+                        dias_venc=dias_venc_sim, fecha_venc=fecha_venc_sim, subyacente=sim_subyacente,
+                        precio_entrada=sim_precio_entrada,
+                    )
+
+    sim_res = st.session_state.get("sim_resultado")
+    if sim_res:
+        theo_sim = bs_price(sim_res["S"], sim_res["strike"], sim_res["dias_venc"]/365, r, sim_res["hv"], sim_res["typ"])
+        c1s, c2s, c3s, c4s = st.columns(4)
+        c1s.metric("Precio del papel", f"{sim_res['S']:,.2f}")
+        c2s.metric("Vencimiento", sim_res["fecha_venc"].strftime("%d/%m/%Y"))
+        c3s.metric("Días restantes", sim_res["dias_venc"])
+        c4s.metric("Black-Scholes hoy", f"{theo_sim:,.2f}")
+        st.caption(f"{sim_res['ticker']} ({sim_res['typ'].upper()}, strike {sim_res['strike']:,.0f}) — simulando entrada a {sim_res['precio_entrada']:,.2f}.")
+
+        tabla_sim = build_movement_scenarios(
+            sim_res["typ"], sim_res["strike"], sim_res["S"], sim_res["dias_venc"], r, sim_res["hv"], sim_res["precio_entrada"],
+        )
+        if not tabla_sim.empty:
+            cols_valor_sim = [c for c in tabla_sim.columns if c.endswith("%") and "Breakeven" not in c and "gcia" not in c]
+            fmt_sim = {c: "{:,.0f}" for c in cols_valor_sim}
+            fmt_sim["Breakeven (mov. %)"] = "{:+.1f}%"
+            fmt_sim["+10% gcia (mov. %)"] = "{:+.1f}%"
+            st.dataframe(tabla_sim.style.format(fmt_sim, na_rep="—"), use_container_width=True)
+            st.caption("Valores teóricos (Black-Scholes) usando la volatilidad histórica del subyacente. No es el precio real de mercado ni una garantía -- es una herramienta para evaluar antes de operar.")
+
+    st.divider()
     st.markdown("### Mi cartera (IOL)")
     st.caption("Trae tus posiciones de opciones de GGAL e YPF desde IOL y sugiere Vender / Mantener / Vigilar según el pronóstico Busa AI y el veredicto técnico vigentes.")
     st.caption("El vencimiento de cada posición se calcula solo, a partir del ticker. Si alguno no se puede interpretar, cae al respaldo configurado en 'Parámetros' de la barra lateral.")
@@ -3538,7 +3653,7 @@ with tabs[5]:
                     intrinsic_pos=intrinsic_pos, extrinsic_pos=extrinsic_pos, theo_pos=theo_pos,
                     compra_op=compra_op, venta_op=venta_op, liquidez_pos=liquidez_pos,
                     valor_esperado_mantener=valor_esperado_mantener, valor_cierre_ahora=valor_cierre_ahora,
-                    hist_opt=hist_opt,
+                    hist_opt=hist_opt, S_pos=S_pos, strike=strike, hv_pos=hv_pos, typ=typ,
                 )
                 if hist_opt_raw is not None:
                     st.session_state.setdefault("hist_opt_raw_debug", {})[ticker] = hist_opt_raw
@@ -3632,6 +3747,22 @@ with tabs[5]:
                             if not pd.isna(extra.get("compra_op", np.nan)) and not pd.isna(extra.get("venta_op", np.nan)):
                                 liq_txt += f" | Compra {extra['compra_op']:.2f} / Venta {extra['venta_op']:.2f}"
                             st.caption(liq_txt)
+
+                            st.markdown("**Cuánto tiene que moverse el papel — semana a semana**")
+                            ppc_ref = r_row["PPC"] if not pd.isna(r_row["PPC"]) else extra.get("theo_pos", np.nan)
+                            tabla_esc = build_movement_scenarios(
+                                extra.get("typ"), extra.get("strike"), extra.get("S_pos"),
+                                extra.get("dias_venc_pos"), r, extra.get("hv_pos"), ppc_ref,
+                            )
+                            if not tabla_esc.empty:
+                                cols_valor = [c for c in tabla_esc.columns if c.endswith("%") and "Breakeven" not in c and "gcia" not in c]
+                                fmt_esc = {c: "{:,.0f}" for c in cols_valor}
+                                fmt_esc["Breakeven (mov. %)"] = "{:+.1f}%"
+                                fmt_esc["+10% gcia (mov. %)"] = "{:+.1f}%"
+                                st.dataframe(tabla_esc.style.format(fmt_esc, na_rep="—"), use_container_width=True)
+                                st.caption(f"Columnas -10%/.../+10%: valor teórico (Black-Scholes) de la opción si el papel se moviera ese % desde hoy ({extra.get('S_pos', float('nan')):,.0f}), en cada semana que va pasando. 'Breakeven' y '+10% gcia': cuánto tiene que moverse el papel, en cada semana, para volver a tu PPC ({ppc_ref:,.2f}) o superarlo en 10%. Valores teóricos, no de mercado -- el precio real puede diferir.")
+                            else:
+                                st.caption("No pude armar la tabla de escenarios (faltan datos de strike, precio del papel o volatilidad para esta posición).")
 
                             hist_opt_pos = extra.get("hist_opt", pd.DataFrame())
                             if hist_opt_pos is not None and not hist_opt_pos.empty:
