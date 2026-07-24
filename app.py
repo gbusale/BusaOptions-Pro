@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.19")
-st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor con Ratio Backspreads + Learning bayesiano + Análisis técnico + Cartera IOL + Fundamentals ADR.")
+st.title("BusaOptions Pro 9.20")
+st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor con Ratio Backspreads + Score Busa recalibrado + Learning bayesiano + Cartera IOL + Fundamentals ADR.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -1704,8 +1704,20 @@ def analyze(df, S, T, r, hv, p_up, p_down, mode):
                 elif iv > hv + 0.15: score -= 25
                 elif iv > hv + 0.07: score -= 12
             if 0.25 <= abs(delta) <= 0.60: score += 10
-            if direction > 0.50: score += 12
-            elif direction < 0.35: score -= 8
+            # Ajuste por dirección: gradual en vez de todo-o-nada. Antes,
+            # cualquier valor entre 35% y 50% no sumaba ni restaba nada,
+            # lo que dejaba pasar opciones con pronóstico apenas bajista
+            # (para un call) sin ninguna penalización. Con esta fórmula,
+            # 50% = neutro, y cada punto por encima/debajo suma o resta
+            # proporcionalmente (tope +/-20).
+            if not np.isnan(direction):
+                score += float(np.clip((direction - 0.50) * 40, -20, 20))
+            # Penalización por moneyness: una opción con muy baja
+            # probabilidad de terminar in-the-money no debería poder llegar
+            # a "OPORTUNIDAD" solo por verse barata en volatilidad implícita.
+            if not np.isnan(prob_itm):
+                if prob_itm < 0.15: score -= 15
+                elif prob_itm < 0.25: score -= 8
             score = max(0, min(100, score))
             if score >= 80: state = "🟢 OPORTUNIDAD"
             elif score >= 65: state = "🟡 INTERESANTE"
