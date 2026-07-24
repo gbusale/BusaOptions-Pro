@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.21")
-st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor + Simulador de escenarios + Cartera IOL + Fundamentals ADR.")
+st.title("BusaOptions Pro 9.22")
+st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor + Simulador de escenarios con semáforo visual + Cartera IOL + Fundamentals ADR.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -1588,6 +1588,37 @@ def build_movement_scenarios(typ, K, S, dias_restantes, r, hv, precio_referencia
         filas.append(fila)
 
     return pd.DataFrame(filas)
+
+
+def style_scenarios_table(tabla_esc, precio_referencia):
+    """
+    Aplica formato numérico + semáforo verde/rojo a la tabla de escenarios:
+    las columnas de valor (-10%...+10%) se pintan de verde si superan el
+    precio de referencia (PPC o entrada simulada, o sea ganancia) y de rojo
+    si quedan por debajo (pérdida), con intensidad proporcional a la
+    magnitud. Las columnas de 'movimiento necesario' quedan sin colorear
+    (son porcentajes de movimiento, no de ganancia/pérdida en sí).
+    """
+    cols_valor = [c for c in tabla_esc.columns if c.endswith("%") and "Breakeven" not in c and "gcia" not in c]
+    fmt_map = {c: "{:,.0f}" for c in cols_valor}
+    if "Breakeven (mov. %)" in tabla_esc.columns:
+        fmt_map["Breakeven (mov. %)"] = "{:+.1f}%"
+    if "+10% gcia (mov. %)" in tabla_esc.columns:
+        fmt_map["+10% gcia (mov. %)"] = "{:+.1f}%"
+
+    def _color(val):
+        if pd.isna(val) or precio_referencia is None or pd.isna(precio_referencia) or precio_referencia == 0:
+            return ""
+        pct_diff = (val - precio_referencia) / precio_referencia
+        intensidad = min(abs(pct_diff), 1.0)
+        alpha = 0.12 + 0.55 * intensidad
+        color_rgb = "21, 128, 61" if pct_diff >= 0 else "185, 28, 28"
+        return f"background-color: rgba({color_rgb}, {alpha:.2f}); color: white"
+
+    styler = tabla_esc.style.format(fmt_map, na_rep="—")
+    for c in cols_valor:
+        styler = styler.map(_color, subset=[c]) if hasattr(styler, "map") else styler.applymap(_color, subset=[c])
+    return styler
 
 
 def position_expected_value(typ, K, cantidad, prima_actual, S, T, mu, hv):
@@ -3471,11 +3502,8 @@ with tabs[5]:
             sim_res["typ"], sim_res["strike"], sim_res["S"], sim_res["dias_venc"], r, sim_res["hv"], sim_res["precio_entrada"],
         )
         if not tabla_sim.empty:
-            cols_valor_sim = [c for c in tabla_sim.columns if c.endswith("%") and "Breakeven" not in c and "gcia" not in c]
-            fmt_sim = {c: "{:,.0f}" for c in cols_valor_sim}
-            fmt_sim["Breakeven (mov. %)"] = "{:+.1f}%"
-            fmt_sim["+10% gcia (mov. %)"] = "{:+.1f}%"
-            st.dataframe(tabla_sim.style.format(fmt_sim, na_rep="—"), use_container_width=True)
+            st.caption(f"🟡 Precio de entrada simulado: **{sim_res['precio_entrada']:,.2f}** — verde = por encima (ganancia), rojo = por debajo (pérdida), más intenso cuanto mayor la diferencia.")
+            st.dataframe(style_scenarios_table(tabla_sim, sim_res["precio_entrada"]), use_container_width=True)
             st.caption("Valores teóricos (Black-Scholes) usando la volatilidad histórica del subyacente. No es el precio real de mercado ni una garantía -- es una herramienta para evaluar antes de operar.")
 
     st.divider()
@@ -3755,12 +3783,9 @@ with tabs[5]:
                                 extra.get("dias_venc_pos"), r, extra.get("hv_pos"), ppc_ref,
                             )
                             if not tabla_esc.empty:
-                                cols_valor = [c for c in tabla_esc.columns if c.endswith("%") and "Breakeven" not in c and "gcia" not in c]
-                                fmt_esc = {c: "{:,.0f}" for c in cols_valor}
-                                fmt_esc["Breakeven (mov. %)"] = "{:+.1f}%"
-                                fmt_esc["+10% gcia (mov. %)"] = "{:+.1f}%"
-                                st.dataframe(tabla_esc.style.format(fmt_esc, na_rep="—"), use_container_width=True)
-                                st.caption(f"Columnas -10%/.../+10%: valor teórico (Black-Scholes) de la opción si el papel se moviera ese % desde hoy ({extra.get('S_pos', float('nan')):,.0f}), en cada semana que va pasando. 'Breakeven' y '+10% gcia': cuánto tiene que moverse el papel, en cada semana, para volver a tu PPC ({ppc_ref:,.2f}) o superarlo en 10%. Valores teóricos, no de mercado -- el precio real puede diferir.")
+                                st.caption(f"🟡 Tu PPC: **{ppc_ref:,.2f}** — verde = por encima (ganancia), rojo = por debajo (pérdida), más intenso cuanto mayor la diferencia.")
+                                st.dataframe(style_scenarios_table(tabla_esc, ppc_ref), use_container_width=True)
+                                st.caption(f"Columnas -10%/.../+10%: valor teórico (Black-Scholes) de la opción si el papel se moviera ese % desde hoy ({extra.get('S_pos', float('nan')):,.0f}), en cada semana que va pasando. 'Breakeven' y '+10% gcia': cuánto tiene que moverse el papel, en cada semana, para volver a tu PPC o superarlo en 10%. Valores teóricos, no de mercado -- el precio real puede diferir.")
                             else:
                                 st.caption("No pude armar la tabla de escenarios (faltan datos de strike, precio del papel o volatilidad para esta posición).")
 
