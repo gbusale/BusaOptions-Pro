@@ -9,7 +9,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from scipy.stats import norm
+from scipy.stats import norm, linregress
 from scipy.optimize import brentq
 import plotly.graph_objects as go
 from api_iol import IOLClient, IOLAuthError, IOLApiError
@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.23")
-st.caption("IOL + Black-Scholes + Busa AI + Advisor + Análisis técnico corto/mediano/largo plazo (SMA200) + Simulador de escenarios + Cartera IOL + Fundamentals ADR.")
+st.title("BusaOptions Pro 9.24")
+st.caption("IOL + Black-Scholes + Busa AI + Advisor + AT corto/mediano/largo plazo (SMA200 + canal de soporte/resistencia clásico) + Simulador + Cartera IOL.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -2019,6 +2019,73 @@ def long_term_trend_reading(close_series, sma200):
     return (f"Precio {relacion} de la SMA200 ({sma200_val:,.2f}, {dist_pct:+.1f}%) — "
             f"estructura de largo plazo {estructura}, sostenida hace {racha} ruedas.")
 
+def find_swing_points(high, low, pivot_window=5):
+    """
+    Detecta picos y valles relevantes (swing highs/lows): un mínimo es
+    'swing low' si es el más bajo dentro de +/- pivot_window ruedas a su
+    alrededor (misma idea para el máximo). Es el primer paso del método
+    clásico de trazar líneas de tendencia: unir esos picos/valles, no el
+    cierre de cada rueda.
+    """
+    n = len(high)
+    swing_highs, swing_lows = [], []
+    for i in range(pivot_window, n - pivot_window):
+        seg_h = high.iloc[i - pivot_window:i + pivot_window + 1]
+        seg_l = low.iloc[i - pivot_window:i + pivot_window + 1]
+        if high.iloc[i] == seg_h.max():
+            swing_highs.append(i)
+        if low.iloc[i] == seg_l.min():
+            swing_lows.append(i)
+    return swing_highs, swing_lows
+
+def compute_swing_trend_line(hist, window_lookback, pivot_window=5, kind="soporte"):
+    """
+    Línea de tendencia clásica: une los mínimos relevantes (soporte, para
+    ver la tendencia alcista) o los máximos relevantes (resistencia, para
+    ver la tendencia bajista) de las últimas 'window_lookback' ruedas --
+    usando el máximo/mínimo real de cada vela (los "bigotes"), como se
+    enseña en los libros de análisis técnico clásico. Si hay 3+ picos/valles
+    relevantes, se ajusta la recta que mejor pasa por todos ellos (mínimos
+    cuadrados); con exactamente 2, la recta los une de forma exacta.
+
+    Devuelve (serie con la recta proyectada sobre todo el tramo, pendiente,
+    r², cantidad de puntos usados) o (None, None, None, None) si no hay
+    suficientes picos/valles para trazarla.
+    """
+    tramo = hist.iloc[-window_lookback:] if len(hist) > window_lookback else hist
+    if len(tramo) < pivot_window * 2 + 3:
+        return None, None, None, None
+    high, low = tramo["High"], tramo["Low"]
+    swing_highs, swing_lows = find_swing_points(high, low, pivot_window)
+    puntos_idx = swing_lows if kind == "soporte" else swing_highs
+    precios = low if kind == "soporte" else high
+
+    if len(puntos_idx) < 2:
+        return None, None, None, None
+
+    x_pts = np.array(puntos_idx, dtype=float)
+    y_pts = precios.iloc[puntos_idx].values
+    slope, intercept, r_value, p_value, std_err = linregress(x_pts, y_pts)
+
+    x_full = np.arange(len(tramo))
+    fitted = pd.Series(intercept + slope * x_full, index=tramo.index)
+    return fitted, slope, r_value ** 2, len(puntos_idx)
+
+def trend_channel_reading(hist, window_lookback, etiqueta, pivot_window=5):
+    fit_sop, slope_sop, r2_sop, n_sop = compute_swing_trend_line(hist, window_lookback, pivot_window, "soporte")
+    fit_res, slope_res, r2_res, n_res = compute_swing_trend_line(hist, window_lookback, pivot_window, "resistencia")
+    if fit_sop is None and fit_res is None:
+        return f"Sin picos/valles suficientes para trazar la tendencia de {etiqueta} ({window_lookback} ruedas)."
+    partes = []
+    if fit_sop is not None:
+        dir_sop = "ascendente" if slope_sop > 0 else "descendente"
+        partes.append(f"soporte {dir_sop} uniendo {n_sop} mínimos (hasta {fit_sop.iloc[-1]:,.0f})")
+    if fit_res is not None:
+        dir_res = "ascendente" if slope_res > 0 else "descendente"
+        partes.append(f"resistencia {dir_res} uniendo {n_res} máximos (hasta {fit_res.iloc[-1]:,.0f})")
+    return f"Canal de tendencia de {etiqueta} ({window_lookback}r): " + " · ".join(partes) + "."
+
+
 def medium_long_cross_reading(ema50, sma200):
     """Cruce dorado (EMA50 > SMA200, sesgo alcista de fondo) o cruce de la muerte (EMA50 < SMA200, sesgo bajista de fondo)."""
     e = ema50.dropna()
@@ -2171,6 +2238,9 @@ TA_THEME = {
     "plus_di": "#26a69a",
     "minus_di": "#ef5350",
     "vol_avg": "#f0b90b",
+    "sma200": "#e879f9",
+    "trend_medio": "#fb923c",
+    "trend_largo": "#a78bfa",
     "grid": "rgba(255,255,255,0.055)",
     "zeroline": "rgba(255,255,255,0.15)",
     "text": "#cbd5e1",
@@ -2211,7 +2281,7 @@ def _last_value_line(fig, x_last, y_last, color, fmt="{:,.2f}"):
     return fig
 
 
-def build_price_figure(hist, sma20, bb_up, bb_dn, ema20, ema50, ticker_key="", lookback_days=180):
+def build_price_figure(hist, sma20, bb_up, bb_dn, ema20, ema50, ticker_key="", lookback_days=180, sma200=None, canal_lookback=120):
     idx = hist.index[-lookback_days:] if len(hist) > lookback_days else hist.index
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -2237,12 +2307,34 @@ def build_price_figure(hist, sma20, bb_up, bb_dn, ema20, ema50, ticker_key="", l
     fig.add_trace(go.Scatter(x=idx, y=ema50.loc[idx], name="EMA50", line=dict(color=TA_THEME["ema50"], width=1.5),
                               hovertemplate="EMA50: %{y:,.2f}<extra></extra>"))
 
+    if sma200 is not None:
+        s200 = sma200.dropna()
+        idx_200 = idx.intersection(s200.index)
+        if len(idx_200) > 0:
+            fig.add_trace(go.Scatter(x=idx_200, y=s200.loc[idx_200], name="SMA200", line=dict(color=TA_THEME["sma200"], width=1.8),
+                                      hovertemplate="SMA200: %{y:,.2f}<extra></extra>"))
+
+    # Canal de tendencia clásico: une mínimos (soporte) y máximos
+    # (resistencia) reales de las velas, no el cierre -- método de libro.
+    fit_sop, *_ = compute_swing_trend_line(hist, canal_lookback, 5, "soporte")
+    fit_res, *_ = compute_swing_trend_line(hist, canal_lookback, 5, "resistencia")
+    if fit_sop is not None:
+        idx_sop = idx.intersection(fit_sop.index)
+        fig.add_trace(go.Scatter(x=idx_sop, y=fit_sop.loc[idx_sop], name=f"Soporte ({canal_lookback}r)",
+                                  line=dict(color=TA_THEME["trend_medio"], width=1.4, dash="dash"),
+                                  hovertemplate="Soporte: %{y:,.2f}<extra></extra>"))
+    if fit_res is not None:
+        idx_res = idx.intersection(fit_res.index)
+        fig.add_trace(go.Scatter(x=idx_res, y=fit_res.loc[idx_res], name=f"Resistencia ({canal_lookback}r)",
+                                  line=dict(color=TA_THEME["trend_largo"], width=1.4, dash="dash"),
+                                  hovertemplate="Resistencia: %{y:,.2f}<extra></extra>"))
+
     last_price = float(hist.loc[idx, "Close"].iloc[-1])
     _last_value_line(fig, idx[-1], last_price, TA_THEME["price"])
 
     fig.update_layout(xaxis_rangeslider_visible=False)
     fig.update_yaxes(tickformat=",.0f")
-    return _finalize_layout(fig, 460, f"Precio, Bollinger(20,2) y EMAs — {ticker_key}", "Precio (ARS)")
+    return _finalize_layout(fig, 460, f"Precio, Bollinger(20,2), EMAs, SMA200 y canal — {ticker_key}", "Precio (ARS)")
 
 def build_volume_figure(hist, ticker_key="", lookback_days=180):
     idx = hist.index[-lookback_days:] if len(hist) > lookback_days else hist.index
@@ -2440,7 +2532,8 @@ def render_technical_panel(ticker_key, activo_seleccionado, period, horizon, lat
         cross_txt = medium_long_cross_reading(ema50, sma200)
         if cross_txt:
             st.write(f"⚔️ {cross_txt}")
-        st.plotly_chart(build_price_figure(hist, sma20, bb_up, bb_dn, ema20, ema50, ticker_key), use_container_width=True, config={"displaylogo": False})
+        st.write(f"📏 {trend_channel_reading(hist, 120, 'mediano plazo')}")
+        st.plotly_chart(build_price_figure(hist, sma20, bb_up, bb_dn, ema20, ema50, ticker_key, sma200=sma200), use_container_width=True, config={"displaylogo": False})
 
     # --- Gráfico 2: Volumen ---
     with st.container(border=True):
