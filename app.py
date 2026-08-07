@@ -99,8 +99,8 @@ div[data-testid="stMetricValue"]{font-size:22px}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("BusaOptions Pro 9.22")
-st.caption("IOL + Black-Scholes con vencimiento automático + Busa AI + Advisor + Simulador de escenarios con semáforo visual + Cartera IOL + Fundamentals ADR.")
+st.title("BusaOptions Pro 9.23")
+st.caption("IOL + Black-Scholes + Busa AI + Advisor + Análisis técnico corto/mediano/largo plazo (SMA200) + Simulador de escenarios + Cartera IOL + Fundamentals ADR.")
 
 TICKERS = {
     "GGAL": {"local": "GGAL.BA", "iol": "GGAL", "adr": "GGAL"},
@@ -1992,6 +1992,54 @@ def trend_expert_reading(close_series, ema50):
         return f"Precio por encima de la EMA50 ({ema50_val:,.2f}) — estructura de tendencia alcista de mediano plazo."
     return f"Precio por debajo de la EMA50 ({ema50_val:,.2f}) — estructura de tendencia bajista de mediano plazo."
 
+def long_term_trend_reading(close_series, sma200):
+    """
+    Lectura de largo plazo usando la SMA200 (media móvil simple de 200
+    ruedas), el benchmark más usado por analistas técnicos para distinguir
+    estructura de mercado alcista de bajista de fondo -- distinto del corto
+    plazo (RSI/MACD/Bollinger, días a semanas) y del mediano plazo (EMA50,
+    semanas a un par de meses).
+    """
+    s = sma200.dropna()
+    if s.empty:
+        return "Sin datos suficientes para la SMA200 (hace falta más historial; probá un período más largo en 'Histórico' en Parámetros)."
+    price = float(close_series.iloc[-1])
+    sma200_val = float(s.iloc[-1])
+    dist_pct = (price / sma200_val - 1) * 100
+    por_encima = price > sma200_val
+    close_vs_sma = (close_series.reindex(s.index) > s)
+    racha = 0
+    for val in close_vs_sma.iloc[::-1]:
+        if val == por_encima:
+            racha += 1
+        else:
+            break
+    estructura = "alcista" if por_encima else "bajista"
+    relacion = "por encima" if por_encima else "por debajo"
+    return (f"Precio {relacion} de la SMA200 ({sma200_val:,.2f}, {dist_pct:+.1f}%) — "
+            f"estructura de largo plazo {estructura}, sostenida hace {racha} ruedas.")
+
+def medium_long_cross_reading(ema50, sma200):
+    """Cruce dorado (EMA50 > SMA200, sesgo alcista de fondo) o cruce de la muerte (EMA50 < SMA200, sesgo bajista de fondo)."""
+    e = ema50.dropna()
+    s = sma200.dropna()
+    if e.empty or s.empty:
+        return None
+    idx_comun = e.index.intersection(s.index)
+    if len(idx_comun) < 2:
+        return None
+    e2, s2 = e.reindex(idx_comun), s.reindex(idx_comun)
+    arriba_ahora = e2.iloc[-1] > s2.iloc[-1]
+    arriba_antes = e2.iloc[-2] > s2.iloc[-2]
+    cruce_txt = ""
+    if arriba_ahora and not arriba_antes:
+        cruce_txt = " (cruce dorado recién formado: la EMA50 acaba de superar a la SMA200)"
+    elif not arriba_ahora and arriba_antes:
+        cruce_txt = " (cruce de la muerte recién formado: la EMA50 acaba de perforar la SMA200 a la baja)"
+    if arriba_ahora:
+        return f"EMA50 por encima de la SMA200 — sesgo de fondo alcista (mediano vs. largo plazo alineados){cruce_txt}."
+    return f"EMA50 por debajo de la SMA200 — sesgo de fondo bajista (mediano vs. largo plazo alineados){cruce_txt}."
+
 def volume_expert_reading(volume_series, close_series):
     if volume_series is None or volume_series.dropna().empty:
         return "Sin datos de volumen disponibles."
@@ -2282,6 +2330,7 @@ def render_technical_panel(ticker_key, activo_seleccionado, period, horizon, lat
     sma20, bb_up, bb_dn = compute_bollinger(close_series)
     ema20 = close_series.ewm(span=20, adjust=False).mean()
     ema50 = close_series.ewm(span=50, adjust=False).mean()
+    sma200 = close_series.rolling(200).mean() if len(close_series) >= 200 else pd.Series(dtype=float)
     adx, plus_di, minus_di = compute_adx(hist["High"], hist["Low"], close_series)
 
     # --- Pronóstico Busa AI (modelo estadístico) ---
@@ -2387,6 +2436,10 @@ def render_technical_panel(ticker_key, activo_seleccionado, period, horizon, lat
     with st.container(border=True):
         st.write(f"📉 {bollinger_expert_reading(close_series, sma20, bb_up, bb_dn)}")
         st.write(f"📐 {trend_expert_reading(close_series, ema50)}")
+        st.write(f"🧱 {long_term_trend_reading(close_series, sma200)}")
+        cross_txt = medium_long_cross_reading(ema50, sma200)
+        if cross_txt:
+            st.write(f"⚔️ {cross_txt}")
         st.plotly_chart(build_price_figure(hist, sma20, bb_up, bb_dn, ema20, ema50, ticker_key), use_container_width=True, config={"displaylogo": False})
 
     # --- Gráfico 2: Volumen ---
@@ -3566,6 +3619,7 @@ with tabs[5]:
                 macd_pos, macd_signal_pos, macd_hist_pos = compute_macd(close_pos)
                 sma20_pos, bb_up_pos, bb_dn_pos = compute_bollinger(close_pos)
                 ema50_pos = close_pos.ewm(span=50, adjust=False).mean()
+                sma200_pos = close_pos.rolling(200).mean() if len(close_pos) >= 200 else pd.Series(dtype=float)
                 adx_pos, plus_di_pos, minus_di_pos = compute_adx(h_pos["High"], h_pos["Low"], close_pos)
                 volumen_pos_series = h_pos["Volume"] if "Volume" in h_pos.columns else None
                 veredicto_pos, _, _, _, _ = technical_verdict(
@@ -3681,7 +3735,7 @@ with tabs[5]:
                     intrinsic_pos=intrinsic_pos, extrinsic_pos=extrinsic_pos, theo_pos=theo_pos,
                     compra_op=compra_op, venta_op=venta_op, liquidez_pos=liquidez_pos,
                     valor_esperado_mantener=valor_esperado_mantener, valor_cierre_ahora=valor_cierre_ahora,
-                    hist_opt=hist_opt, S_pos=S_pos, strike=strike, hv_pos=hv_pos, typ=typ,
+                    hist_opt=hist_opt, S_pos=S_pos, strike=strike, hv_pos=hv_pos, typ=typ, sma200_pos=sma200_pos,
                 )
                 if hist_opt_raw is not None:
                     st.session_state.setdefault("hist_opt_raw_debug", {})[ticker] = hist_opt_raw
@@ -3761,6 +3815,10 @@ with tabs[5]:
                             st.write(f"📊 {macd_expert_reading(extra['macd_pos'], extra['macd_signal_pos'], extra['macd_hist_pos'])}")
                             st.write(f"📉 {bollinger_expert_reading(extra['close_pos'], extra['sma20_pos'], extra['bb_up_pos'], extra['bb_dn_pos'])}")
                             st.write(f"📐 {trend_expert_reading(extra['close_pos'], extra['ema50_pos'])}")
+                            st.write(f"🧱 {long_term_trend_reading(extra['close_pos'], extra.get('sma200_pos', pd.Series(dtype=float)))}")
+                            cross_txt_pos = medium_long_cross_reading(extra['ema50_pos'], extra.get('sma200_pos', pd.Series(dtype=float)))
+                            if cross_txt_pos:
+                                st.write(f"⚔️ {cross_txt_pos}")
                             st.write(f"🧭 {adx_expert_reading(extra['adx_pos'], extra['plus_di_pos'], extra['minus_di_pos'])}")
                             if extra.get("volumen_pos_series") is not None:
                                 st.write(f"📦 {volume_expert_reading(extra['volumen_pos_series'], extra['close_pos'])}")
