@@ -835,6 +835,56 @@ def extract_fundamentals(info):
         "Cantidad analistas": g("numberOfAnalystOpinions"),
     }
 
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
+def get_calendar(ticker_adr):
+    """
+    Próximo balance (Earnings Date) y próximo dividendo del ADR, vía
+    yfinance. Se cachea 6hs porque estas fechas casi no cambian en el día
+    (a diferencia de las noticias, que sí).
+    """
+    try:
+        cal = yf.Ticker(ticker_adr).calendar
+        return cal if isinstance(cal, dict) else {}
+    except Exception:
+        return {}
+
+def extract_calendar(cal):
+    """
+    Extracción defensiva del calendario de yfinance. 'Earnings Date' puede
+    venir como fecha única o como rango [inicio, fin] según cuánta certeza
+    tenga la fuente sobre el día exacto.
+    """
+    if not isinstance(cal, dict) or not cal:
+        return {}
+    earnings = cal.get("Earnings Date")
+    earnings_from = earnings_to = None
+    if isinstance(earnings, (list, tuple)) and earnings:
+        earnings_from, earnings_to = earnings[0], earnings[-1]
+    elif earnings:
+        earnings_from = earnings_to = earnings
+    return {
+        "Próximo balance desde": earnings_from,
+        "Próximo balance hasta": earnings_to,
+        "EPS estimado (prom.)": cal.get("Earnings Average"),
+        "EPS estimado (mín./máx.)": (cal.get("Earnings Low"), cal.get("Earnings High")),
+        "Ingresos estimados (prom., USD)": cal.get("Revenue Average"),
+        "Fecha de pago de dividendo": cal.get("Dividend Date"),
+        "Fecha ex-dividendo": cal.get("Ex-Dividend Date"),
+    }
+
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
+def get_dividend_history(ticker_adr, n=6):
+    """Últimos pagos de dividendo del ADR, vía yfinance (historial real, no estimado)."""
+    try:
+        div = yf.Ticker(ticker_adr).dividends
+        if div is None or div.empty:
+            return pd.DataFrame()
+        out = div.tail(n).reset_index()
+        out.columns = ["Fecha", "Dividendo (USD/acción)"]
+        return out.iloc[::-1].reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_news(ticker_adr):
     """
@@ -849,6 +899,16 @@ def get_news(ticker_adr):
         return raw if isinstance(raw, list) else []
     except Exception:
         return []
+
+def _md_escape_dollar(text):
+    """
+    Streamlit interpreta pares de '$' en markdown como delimitadores de
+    fórmula LaTeX -- texto externo (noticias, resúmenes) suele traer '$'
+    sueltos (precios, montos) que sin escapar rompen el renderizado o hacen
+    desaparecer partes del texto. Se escapa acá, en un solo lugar, para
+    cualquier texto de noticias que se muestre en la UI.
+    """
+    return text.replace("$", "\\$") if isinstance(text, str) else text
 
 def extract_news(raw_news, limit=8):
     """Extracción defensiva de yfinance .news -- el esquema (anidado bajo 'content') cambió más de una vez entre versiones."""
@@ -868,8 +928,8 @@ def extract_news(raw_news, limit=8):
             except Exception:
                 fecha_fmt = str(pub_date)
         out.append({
-            "Título": title,
-            "Resumen": content.get("summary") or content.get("description") or "",
+            "Título": _md_escape_dollar(title),
+            "Resumen": _md_escape_dollar(content.get("summary") or content.get("description") or ""),
             "Fuente": provider,
             "Fecha": fecha_fmt,
             "URL": url,
@@ -3800,6 +3860,41 @@ with tabs[5]:
 
         st.caption("Fuente: Yahoo Finance (ADR). Los fundamentales de la especie local en BYMA no suelen estar disponibles ahí, por eso se usa el ADR como referencia. Esto es información, no una recomendación de inversión.")
 
+        st.markdown(f"##### Próximo balance y dividendos — {fund_ticker_choice} ({adr_ticker})")
+        cal_info = extract_calendar(get_calendar(adr_ticker))
+        if not cal_info:
+            st.info("No pude traer fecha de balance/dividendo en este momento.")
+        else:
+            e_from, e_to = cal_info.get("Próximo balance desde"), cal_info.get("Próximo balance hasta")
+            if e_from:
+                e_txt = e_from.strftime("%d/%m/%Y") if e_from == e_to else f"{e_from.strftime('%d/%m/%Y')} - {e_to.strftime('%d/%m/%Y')}"
+                dias_balance = (e_from - datetime.now().date()).days
+                cb1, cb2 = st.columns(2)
+                cb1.metric("Próximo balance", e_txt)
+                cb2.metric("Faltan", f"{dias_balance} días" if dias_balance >= 0 else "ya reportó")
+                eps_avg = cal_info.get("EPS estimado (prom.)")
+                if eps_avg is not None:
+                    eps_lo, eps_hi = cal_info.get("EPS estimado (mín./máx.)", (None, None))
+                    st.caption(f"EPS estimado por analistas: US\\$ {eps_avg:.2f}" + (f" (rango US\\$ {eps_lo:.2f} a US\\$ {eps_hi:.2f})" if eps_lo is not None and eps_hi is not None else "") + ". Un balance es el evento de mayor volatilidad esperada -- si cae antes del vencimiento de tu opción, es relevante.")
+            else:
+                st.caption("Sin fecha de próximo balance confirmada por el proveedor todavía.")
+
+            fecha_div, fecha_exdiv = cal_info.get("Fecha de pago de dividendo"), cal_info.get("Fecha ex-dividendo")
+            if fecha_div or fecha_exdiv:
+                dv1, dv2 = st.columns(2)
+                dv1.metric("Próximo pago de dividendo", fecha_div.strftime("%d/%m/%Y") if fecha_div else "")
+                dv2.metric("Fecha ex-dividendo", fecha_exdiv.strftime("%d/%m/%Y") if fecha_exdiv else "")
+                st.caption("Desde la fecha ex-dividendo, el precio de la acción suele ajustarse hacia abajo por el monto del dividendo -- no es necesariamente una baja 'real' del papel.")
+
+            hist_div = get_dividend_history(adr_ticker)
+            if not hist_div.empty:
+                st.markdown("**Historial de dividendos pagados (ADR, últimos 6)**")
+                st.dataframe(
+                    hist_div.style.format({"Fecha": lambda d: pd.to_datetime(d).strftime("%d/%m/%Y"), "Dividendo (USD/acción)": "{:.3f}"}),
+                    use_container_width=True,
+                )
+            st.caption("Fuente: Yahoo Finance. Las fechas de balance son estimadas por el proveedor hasta que la empresa confirma la fecha exacta -- pueden moverse.")
+
         st.markdown(f"##### Noticias recientes — {fund_ticker_choice} ({adr_ticker})")
         noticias = extract_news(get_news(adr_ticker), limit=8)
         if not noticias:
@@ -4147,7 +4242,7 @@ with tabs[5]:
                                 lo52 = fund_pos.get("Mín. 52 sem.")
                                 if hi52 and lo52 and hi52 > lo52:
                                     pos_rango = (precio_adr - lo52) / (hi52 - lo52) * 100
-                                    st.write(f"📊 ADR en US$ {precio_adr:.2f}, en el {pos_rango:.0f}% de su rango de 52 semanas (US$ {lo52:.2f} - US$ {hi52:.2f}).")
+                                    st.write(f"📊 ADR en US\\$ {precio_adr:.2f}, en el {pos_rango:.0f}% de su rango de 52 semanas (US\\$ {lo52:.2f} - US\\$ {hi52:.2f}).")
                                 target = fund_pos.get("Precio objetivo analistas (USD)")
                                 rec = fund_pos.get("Recomendación analistas")
                                 n_an = fund_pos.get("Cantidad analistas")
@@ -4162,6 +4257,19 @@ with tabs[5]:
                                     f"Beta: {fund_pos['Beta']:.2f}" if fund_pos.get("Beta") else None,
                                 ])) or "💼 Sin más datos fundamentales disponibles.")
                                 st.caption("Fuente: Yahoo Finance sobre el ADR (afuera, en USD). Es la lectura de largo plazo del papel -- no está pensada para decidir el timing de una posición de opciones que vence en semanas, pero da contexto de si la baja reciente es de fondo o coyuntural.")
+
+                                cal_pos = extract_calendar(get_calendar(adr_ticker_pos))
+                                e_from_pos = cal_pos.get("Próximo balance desde")
+                                dias_venc_cal = extra.get("dias_venc_pos")
+                                if e_from_pos:
+                                    dias_a_balance = (e_from_pos - datetime.now().date()).days
+                                    if dias_venc_cal is not None and not pd.isna(dias_venc_cal) and 0 <= dias_a_balance <= dias_venc_cal:
+                                        st.warning(f"📅 {extra['subyacente']} presenta balance el {e_from_pos.strftime('%d/%m/%Y')} (en {dias_a_balance} días) -- **antes** de que venza tu opción. Es el evento de mayor volatilidad esperada en el medio.")
+                                    elif dias_a_balance >= 0:
+                                        st.caption(f"📅 Próximo balance de {extra['subyacente']}: {e_from_pos.strftime('%d/%m/%Y')} (en {dias_a_balance} días).")
+                                fecha_exdiv_pos = cal_pos.get("Fecha ex-dividendo")
+                                if fecha_exdiv_pos:
+                                    st.caption(f"💵 Fecha ex-dividendo de {extra['subyacente']}: {fecha_exdiv_pos.strftime('%d/%m/%Y')}.")
 
                                 noticias_pos = extract_news(get_news(adr_ticker_pos), limit=3)
                                 if noticias_pos:
