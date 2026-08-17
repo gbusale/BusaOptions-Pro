@@ -770,12 +770,40 @@ def evaluate_pending_predictions(activo, current_price, lateral_threshold):
 # =========================
 # Datos y matemática
 # =========================
-@st.cache_data(ttl=180)
-def get_hist(ticker, period):
+def _download_hist(ticker, period):
     df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df.dropna()
+
+@st.cache_data(ttl=180)
+def _get_hist_cached(ticker, period):
+    return _download_hist(ticker, period)
+
+def get_hist(ticker, period):
+    """
+    Envuelve _get_hist_cached con reintentos y sin cachear un resultado
+    vacío como si fuera válido. Yahoo Finance a veces bloquea/limita de
+    forma temporal los pedidos desde la IP compartida de Streamlit Cloud y
+    devuelve un DataFrame vacío sin lanzar excepción (no es un error de la
+    app). Sin este manejo, ese vacío quedaba cacheado 3 minutos y el
+    mensaje de error se mostraba aunque Yahoo ya hubiera vuelto a
+    responder.
+    """
+    df = _get_hist_cached(ticker, period)
+    if not df.empty:
+        return df
+    import time
+    _get_hist_cached.clear()
+    for _ in range(2):
+        time.sleep(1.5)
+        try:
+            df = _download_hist(ticker, period)
+        except Exception:
+            continue
+        if not df.empty:
+            return df
+    return df
 
 @st.cache_data(ttl=3600 * 12, show_spinner=False)
 def get_fundamentals(ticker_adr):
