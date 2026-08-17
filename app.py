@@ -848,29 +848,46 @@ def get_calendar(ticker_adr):
     except Exception:
         return {}
 
-def extract_calendar(cal):
+def extract_calendar(info, cal=None):
     """
-    Extracción defensiva del calendario de yfinance. 'Earnings Date' puede
-    venir como fecha única o como rango [inicio, fin] según cuánta certeza
-    tenga la fuente sobre el día exacto.
+    Fechas de balance y dividendo. Prioriza los timestamps que vienen en
+    'info' (el mismo dict que ya usa extract_fundamentals -- confirmado que
+    funciona en Streamlit Cloud) y usa el endpoint separado '.calendar' sólo
+    como complemento opcional para el rango de EPS estimado, que no viene en
+    info. Así, si '.calendar' falla en algún entorno (le pasó en Cloud),
+    las fechas igual se muestran.
     """
-    if not isinstance(cal, dict) or not cal:
-        return {}
-    earnings = cal.get("Earnings Date")
-    earnings_from = earnings_to = None
-    if isinstance(earnings, (list, tuple)) and earnings:
-        earnings_from, earnings_to = earnings[0], earnings[-1]
-    elif earnings:
-        earnings_from = earnings_to = earnings
-    return {
-        "Próximo balance desde": earnings_from,
-        "Próximo balance hasta": earnings_to,
-        "EPS estimado (prom.)": cal.get("Earnings Average"),
-        "EPS estimado (mín./máx.)": (cal.get("Earnings Low"), cal.get("Earnings High")),
-        "Ingresos estimados (prom., USD)": cal.get("Revenue Average"),
-        "Fecha de pago de dividendo": cal.get("Dividend Date"),
-        "Fecha ex-dividendo": cal.get("Ex-Dividend Date"),
-    }
+    def _ts(v):
+        if v is None:
+            return None
+        try:
+            return pd.to_datetime(v, unit="s").date()
+        except Exception:
+            return None
+
+    out = {}
+    if isinstance(info, dict) and info:
+        earnings_from = _ts(info.get("earningsTimestampStart") or info.get("earningsTimestamp"))
+        earnings_to = _ts(info.get("earningsTimestampEnd") or info.get("earningsTimestamp"))
+        out["Próximo balance desde"] = earnings_from
+        out["Próximo balance hasta"] = earnings_to or earnings_from
+        out["Fecha de pago de dividendo"] = _ts(info.get("dividendDate"))
+        out["Fecha ex-dividendo"] = _ts(info.get("exDividendDate"))
+
+    if isinstance(cal, dict) and cal:
+        if not out.get("Próximo balance desde"):
+            earnings = cal.get("Earnings Date")
+            if isinstance(earnings, (list, tuple)) and earnings:
+                out["Próximo balance desde"], out["Próximo balance hasta"] = earnings[0], earnings[-1]
+            elif earnings:
+                out["Próximo balance desde"] = out["Próximo balance hasta"] = earnings
+        out["EPS estimado (prom.)"] = cal.get("Earnings Average")
+        out["EPS estimado (mín./máx.)"] = (cal.get("Earnings Low"), cal.get("Earnings High"))
+        out["Ingresos estimados (prom., USD)"] = cal.get("Revenue Average")
+        out["Fecha de pago de dividendo"] = out.get("Fecha de pago de dividendo") or cal.get("Dividend Date")
+        out["Fecha ex-dividendo"] = out.get("Fecha ex-dividendo") or cal.get("Ex-Dividend Date")
+
+    return {k: v for k, v in out.items() if v is not None}
 
 @st.cache_data(ttl=3600 * 6, show_spinner=False)
 def get_dividend_history(ticker_adr, n=6):
@@ -905,10 +922,40 @@ def _md_escape_dollar(text):
     Streamlit interpreta pares de '$' en markdown como delimitadores de
     fórmula LaTeX -- texto externo (noticias, resúmenes) suele traer '$'
     sueltos (precios, montos) que sin escapar rompen el renderizado o hacen
-    desaparecer partes del texto. Se escapa acá, en un solo lugar, para
-    cualquier texto de noticias que se muestre en la UI.
+    desaparecer partes del texto. Se escapa al momento de mostrar (no acá en
+    la extracción) para no interferir con la traducción, que corre sobre el
+    texto original en inglés.
     """
     return text.replace("$", "\\$") if isinstance(text, str) else text
+
+@st.cache_data(ttl=3600 * 24, show_spinner=False)
+def translate_es(text):
+    """
+    Traducción liviana EN->ES para el resumen de noticias (deep_translator,
+    sin API key -- usa el endpoint público de Google Translate). Se cachea
+    24hs por texto exacto para no traducir lo mismo en cada rerun ni abusar
+    del endpoint. Si falla -- sin internet, endpoint bloqueado, rate limit,
+    etc. -- se devuelve el texto original en inglés en vez de romper la UI:
+    la noticia se sigue viendo, sólo que sin traducir.
+
+    El endpoint a veces no lanza excepción ante un error del servidor --
+    devuelve la página de error HTML como si fuera el texto traducido. Se
+    valida el resultado para detectar ese caso también, no sólo excepciones.
+    """
+    if not text:
+        return text
+    import time
+    from deep_translator import GoogleTranslator
+    marcas_error = ("error 500", "that's an error", "that’s an error", "<html")
+    for intento in range(3):
+        try:
+            time.sleep(0.15 + intento * 0.5)
+            result = GoogleTranslator(source="auto", target="es").translate(text)
+            if isinstance(result, str) and result.strip() and not any(m in result.lower() for m in marcas_error):
+                return result
+        except Exception:
+            pass
+    return text
 
 def extract_news(raw_news, limit=8):
     """Extracción defensiva de yfinance .news -- el esquema (anidado bajo 'content') cambió más de una vez entre versiones."""
@@ -928,8 +975,8 @@ def extract_news(raw_news, limit=8):
             except Exception:
                 fecha_fmt = str(pub_date)
         out.append({
-            "Título": _md_escape_dollar(title),
-            "Resumen": _md_escape_dollar(content.get("summary") or content.get("description") or ""),
+            "Título": title,
+            "Resumen": content.get("summary") or content.get("description") or "",
             "Fuente": provider,
             "Fecha": fecha_fmt,
             "URL": url,
@@ -937,6 +984,22 @@ def extract_news(raw_news, limit=8):
         if len(out) >= limit:
             break
     return out
+
+def render_news_item(noticia, mostrar_resumen=True):
+    """
+    Muestra una noticia traducida al español (título + resumen), con el
+    link apuntando siempre a la nota original en inglés por si se quiere
+    leer completa. Traduce sobre el texto crudo y recién ahí escapa '$'
+    (ver _md_escape_dollar) para no romper ni la traducción ni el render.
+    """
+    titulo_es = _md_escape_dollar(translate_es(noticia["Título"]))
+    link_txt = f"[{titulo_es}]({noticia['URL']})" if noticia["URL"] else titulo_es
+    st.write(f"📰 {link_txt}")
+    meta = " · ".join(filter(None, [noticia["Fuente"], noticia["Fecha"]]))
+    if meta:
+        st.caption(meta)
+    if mostrar_resumen and noticia["Resumen"]:
+        st.caption(_md_escape_dollar(translate_es(noticia["Resumen"])))
 
 def clean_num(x):
     if x is None or pd.isna(x):
@@ -3861,7 +3924,7 @@ with tabs[5]:
         st.caption("Fuente: Yahoo Finance (ADR). Los fundamentales de la especie local en BYMA no suelen estar disponibles ahí, por eso se usa el ADR como referencia. Esto es información, no una recomendación de inversión.")
 
         st.markdown(f"##### Próximo balance y dividendos — {fund_ticker_choice} ({adr_ticker})")
-        cal_info = extract_calendar(get_calendar(adr_ticker))
+        cal_info = extract_calendar(info_fund, get_calendar(adr_ticker))
         if not cal_info:
             st.info("No pude traer fecha de balance/dividendo en este momento.")
         else:
@@ -3901,14 +3964,8 @@ with tabs[5]:
             st.info("No pude traer noticias en este momento (puede ser un corte temporal del proveedor).")
         else:
             for noticia in noticias:
-                titulo = f"[{noticia['Título']}]({noticia['URL']})" if noticia["URL"] else noticia["Título"]
-                st.write(f"📰 {titulo}")
-                meta = " · ".join(filter(None, [noticia["Fuente"], noticia["Fecha"]]))
-                if meta:
-                    st.caption(meta)
-                if noticia["Resumen"]:
-                    st.caption(noticia["Resumen"])
-            st.caption("Fuente: Yahoo Finance (agregador de medios: Reuters, GuruFocus, Motley Fool, etc.). Son noticias tal cual las publican esos medios -- no es un análisis ni una recomendación nuestra.")
+                render_news_item(noticia)
+            st.caption("Fuente: Yahoo Finance (agregador de medios: Reuters, GuruFocus, Motley Fool, etc.), resumen traducido automáticamente al español -- el link va a la nota original en inglés. No es un análisis ni una recomendación nuestra.")
 
     st.divider()
     st.markdown("### Simulador de escenarios (sin necesidad de cartera)")
@@ -4234,7 +4291,8 @@ with tabs[5]:
                                 st.write(f"📦 {volume_expert_reading(extra['volumen_pos_series'], extra['close_pos'])}")
 
                             adr_ticker_pos = TICKERS.get(extra["subyacente"], {}).get("adr")
-                            fund_pos = extract_fundamentals(get_fundamentals(adr_ticker_pos)) if adr_ticker_pos else {}
+                            info_pos_raw = get_fundamentals(adr_ticker_pos) if adr_ticker_pos else {}
+                            fund_pos = extract_fundamentals(info_pos_raw) if adr_ticker_pos else {}
                             if fund_pos and fund_pos.get("Precio ADR (USD)") is not None:
                                 st.markdown(f"**Fundamentales de {extra['subyacente']} (ADR {adr_ticker_pos}, largo plazo -- independiente del pronóstico de corto plazo)**")
                                 precio_adr = fund_pos["Precio ADR (USD)"]
@@ -4258,7 +4316,7 @@ with tabs[5]:
                                 ])) or "💼 Sin más datos fundamentales disponibles.")
                                 st.caption("Fuente: Yahoo Finance sobre el ADR (afuera, en USD). Es la lectura de largo plazo del papel -- no está pensada para decidir el timing de una posición de opciones que vence en semanas, pero da contexto de si la baja reciente es de fondo o coyuntural.")
 
-                                cal_pos = extract_calendar(get_calendar(adr_ticker_pos))
+                                cal_pos = extract_calendar(info_pos_raw, get_calendar(adr_ticker_pos))
                                 e_from_pos = cal_pos.get("Próximo balance desde")
                                 dias_venc_cal = extra.get("dias_venc_pos")
                                 if e_from_pos:
@@ -4275,11 +4333,7 @@ with tabs[5]:
                                 if noticias_pos:
                                     st.markdown(f"**Últimas noticias de {extra['subyacente']}**")
                                     for noticia_pos in noticias_pos:
-                                        titulo_pos = f"[{noticia_pos['Título']}]({noticia_pos['URL']})" if noticia_pos["URL"] else noticia_pos["Título"]
-                                        st.write(f"📰 {titulo_pos}")
-                                        meta_pos = " · ".join(filter(None, [noticia_pos["Fuente"], noticia_pos["Fecha"]]))
-                                        if meta_pos:
-                                            st.caption(meta_pos)
+                                        render_news_item(noticia_pos, mostrar_resumen=False)
                                     st.caption("Ver más en Favoritos → Análisis fundamental y ADR.")
 
                             st.markdown("**Valor esperado: mantener vs. cerrar ahora**")

@@ -6,3 +6,4 @@ scipy
 plotly
 requests
 PyOBD
+deep-translator
