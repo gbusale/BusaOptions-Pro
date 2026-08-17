@@ -835,6 +835,49 @@ def extract_fundamentals(info):
         "Cantidad analistas": g("numberOfAnalystOpinions"),
     }
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_news(ticker_adr):
+    """
+    Noticias recientes del ADR vía yfinance (agregador de Yahoo Finance:
+    Reuters, GuruFocus, Motley Fool, etc.). Se cachea 30 min porque las
+    noticias cambian mucho más rápido que los fundamentales. Devuelve la
+    lista cruda -- se parsea en extract_news() para aislar a la app de
+    cambios de formato de la librería.
+    """
+    try:
+        raw = yf.Ticker(ticker_adr).news
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        return []
+
+def extract_news(raw_news, limit=8):
+    """Extracción defensiva de yfinance .news -- el esquema (anidado bajo 'content') cambió más de una vez entre versiones."""
+    out = []
+    for item in (raw_news or []):
+        content = item.get("content", item) if isinstance(item, dict) else {}
+        title = content.get("title")
+        if not title:
+            continue
+        url = (content.get("canonicalUrl") or content.get("clickThroughUrl") or {}).get("url")
+        provider = (content.get("provider") or {}).get("displayName", "")
+        pub_date = content.get("pubDate") or content.get("displayTime")
+        fecha_fmt = ""
+        if pub_date:
+            try:
+                fecha_fmt = pd.to_datetime(pub_date).strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                fecha_fmt = str(pub_date)
+        out.append({
+            "Título": title,
+            "Resumen": content.get("summary") or content.get("description") or "",
+            "Fuente": provider,
+            "Fecha": fecha_fmt,
+            "URL": url,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
 def clean_num(x):
     if x is None or pd.isna(x):
         return np.nan
@@ -2339,6 +2382,96 @@ TA_THEME = {
     "title": "#f1f5f9",
 }
 
+def multi_horizon_verdict(rsi, macd, macd_signal, close_series, sma20, ema50, sma200, adx, plus_di, minus_di):
+    """
+    Lectura técnica organizada explícitamente por plazo (corto / mediano /
+    largo), a partir de los mismos indicadores que ya usa technical_verdict()
+    -- acá se agrupan por horizonte en vez de votarse todos juntos, para
+    responder directamente "¿está bajista de corto, de mediano, o de fondo?".
+
+    - Corto plazo (días): osciladores -- RSI, MACD vs. señal, precio vs. SMA20.
+    - Mediano plazo (semanas): precio vs. EMA50 + dirección del ADX/DI (sólo
+      cuenta si ADX >= 20, si no hay tendencia el veredicto queda neutral).
+    - Largo plazo (meses+): precio vs. SMA200 + si la EMA50 ya cruzó por
+      debajo de la SMA200 ("death cross") o sigue por encima.
+    """
+    price = float(close_series.iloc[-1])
+
+    corto_score = 0
+    corto_detalle = []
+    rsi_s = rsi.dropna()
+    if not rsi_s.empty:
+        rsi_last = float(rsi_s.iloc[-1])
+        if rsi_last > 55:
+            corto_score += 1; corto_detalle.append(f"RSI {rsi_last:.0f} alcista")
+        elif rsi_last < 45:
+            corto_score -= 1; corto_detalle.append(f"RSI {rsi_last:.0f} bajista")
+        else:
+            corto_detalle.append(f"RSI {rsi_last:.0f} neutral")
+    macd_s = macd.dropna()
+    if not macd_s.empty:
+        if float(macd.iloc[-1]) > float(macd_signal.iloc[-1]):
+            corto_score += 1; corto_detalle.append("MACD sobre señal")
+        else:
+            corto_score -= 1; corto_detalle.append("MACD bajo señal")
+    sma20_s = sma20.dropna()
+    if not sma20_s.empty:
+        if price > float(sma20.iloc[-1]):
+            corto_score += 1; corto_detalle.append("precio sobre SMA20")
+        else:
+            corto_score -= 1; corto_detalle.append("precio bajo SMA20")
+    corto_verdict = "ALCISTA" if corto_score >= 2 else "BAJISTA" if corto_score <= -2 else "NEUTRAL"
+
+    mediano_score = 0
+    mediano_detalle = []
+    ema50_s = ema50.dropna()
+    if not ema50_s.empty:
+        if price > float(ema50.iloc[-1]):
+            mediano_score += 1; mediano_detalle.append("precio sobre EMA50")
+        else:
+            mediano_score -= 1; mediano_detalle.append("precio bajo EMA50")
+    adx_s = adx.dropna()
+    if not adx_s.empty:
+        adx_last = float(adx_s.iloc[-1])
+        pdi_s, mdi_s = plus_di.dropna(), minus_di.dropna()
+        pdi_last = float(pdi_s.iloc[-1]) if not pdi_s.empty else np.nan
+        mdi_last = float(mdi_s.iloc[-1]) if not mdi_s.empty else np.nan
+        if adx_last >= 20 and not pd.isna(pdi_last) and not pd.isna(mdi_last):
+            if pdi_last > mdi_last:
+                mediano_score += 1; mediano_detalle.append(f"ADX {adx_last:.0f} con +DI dominante")
+            else:
+                mediano_score -= 1; mediano_detalle.append(f"ADX {adx_last:.0f} con -DI dominante")
+        else:
+            mediano_detalle.append(f"ADX {adx_last:.0f}: sin tendencia confirmada todavía")
+    mediano_verdict = "ALCISTA" if mediano_score >= 2 else "BAJISTA" if mediano_score <= -2 else "NEUTRAL"
+
+    largo_detalle = []
+    largo_verdict = "SIN DATOS"
+    sma200_s = sma200.dropna() if sma200 is not None else pd.Series(dtype=float)
+    if not sma200_s.empty:
+        largo_score = 0
+        sma200_last = float(sma200_s.iloc[-1])
+        dist_pct = (price / sma200_last - 1) * 100
+        if price > sma200_last:
+            largo_score += 1; largo_detalle.append(f"precio {dist_pct:+.1f}% vs. SMA200")
+        else:
+            largo_score -= 1; largo_detalle.append(f"precio {dist_pct:+.1f}% vs. SMA200")
+        if not ema50_s.empty:
+            if float(ema50_s.iloc[-1]) > sma200_last:
+                largo_score += 1; largo_detalle.append("EMA50 sobre SMA200 (sin cruce bajista)")
+            else:
+                largo_score -= 1; largo_detalle.append("EMA50 bajo SMA200 ('death cross')")
+        largo_verdict = "ALCISTA" if largo_score >= 2 else "BAJISTA" if largo_score <= -2 else "NEUTRAL"
+    else:
+        largo_detalle.append("Se necesitan 200 ruedas de histórico para la SMA200.")
+
+    return {
+        "Corto plazo": {"veredicto": corto_verdict, "detalle": corto_detalle},
+        "Mediano plazo": {"veredicto": mediano_verdict, "detalle": mediano_detalle},
+        "Largo plazo": {"veredicto": largo_verdict, "detalle": largo_detalle},
+    }
+
+
 def _style_axes(fig, yaxis_title=None):
     fig.update_xaxes(showgrid=True, gridcolor=TA_THEME["grid"], zeroline=False, showline=True, linecolor=TA_THEME["grid"])
     fig.update_yaxes(showgrid=True, gridcolor=TA_THEME["grid"], zeroline=False, showline=True, linecolor=TA_THEME["grid"], title_text=yaxis_title, title_font=dict(size=11, color=TA_THEME["text"]))
@@ -2615,6 +2748,19 @@ def render_technical_panel(ticker_key, activo_seleccionado, period, horizon, lat
             conf_txt = "tendencia confirmada (ADX ≥ 25): el veredicto tiene más respaldo" if tendencia_fuerte else "sin tendencia fuerte todavía (ADX < 25): tomar el veredicto con más cautela, el mercado puede estar en rango"
             st.caption(f"Fuerza de tendencia (ADX): {adx_last:.1f} — {conf_txt}.")
         st.caption("Veredicto técnico (RSI + MACD + Bollinger + tendencia + volumen). Es independiente del pronóstico estadístico Busa AI de arriba: pueden coincidir o no.")
+
+    # --- Análisis técnico por plazo (corto / mediano / largo) ---
+    with st.container(border=True):
+        st.markdown(f"##### Análisis técnico por plazo — {ticker_key}")
+        horizontes = multi_horizon_verdict(rsi, macd, macd_signal, close_series, sma20, ema50, sma200, adx, plus_di, minus_di)
+        hcols = st.columns(3)
+        for hcol, (nombre_h, datos_h) in zip(hcols, horizontes.items()):
+            v_h = datos_h["veredicto"]
+            css_h = "score-good" if v_h == "ALCISTA" else "score-bad" if v_h == "BAJISTA" else "score-mid"
+            hcol.markdown(f"**{nombre_h}**")
+            hcol.markdown(f'<span class="{css_h}" style="font-size:18px;">{v_h}</span>', unsafe_allow_html=True)
+            hcol.caption(" · ".join(datos_h["detalle"]))
+        st.caption("Corto plazo (días): RSI + MACD + precio vs. SMA20. Mediano plazo (semanas): precio vs. EMA50 + dirección del ADX/DI. Largo plazo (meses+): precio vs. SMA200 + cruce EMA50/SMA200. Análisis técnico puro basado en reglas explícitas -- no es asesoramiento financiero personalizado.")
 
     # --- Gráfico 1: Precio + Bollinger + EMAs ---
     with st.container(border=True):
@@ -3105,10 +3251,11 @@ with st.sidebar:
                                 help="Ajuste chico y acotado, no reemplaza al modelo estadístico.")
         tilt_strength = st.slider("Fuerza del sesgo técnico", 0.0, 2.0, 1.0, 0.1) if use_tilt else 0.0
 
-    with st.expander("Aprendizaje (avanzado)", expanded=False):
-        st.caption("Cuántas señales evaluadas recientes considera el Learning, y qué tan rápido reacciona.")
-        learning_window = st.number_input("Ventana de señales evaluadas", 10, 100, 40, 5)
-        learning_prior_strength = st.slider("Peso del prior (más alto = más lento para reaccionar)", 1, 20, 6, 1)
+    # Sección "Aprendizaje" oculta por ahora (2026-08): con muy pocas señales
+    # evaluadas todavía no aporta nada útil y sólo generaba confusión en la
+    # UI. Se dejan los defaults fijos -- con 0 señales evaluadas el ajuste es
+    # un no-op (factor 1.0), así que ocultarla no cambia el pronóstico.
+    learning_window, learning_prior_strength = 40, 6
 
     if st.button("🔄 Actualizar mercado (IOL)"):
         try:
@@ -3348,7 +3495,7 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Probabilidades y Análisis Técnico")
-    st.caption("Pronóstico Busa AI (modelo estadístico + Learning) y análisis técnico clásico — RSI, MACD, Bandas de Bollinger y EMAs — para GGAL e YPF en BYMA.")
+    st.caption("Pronóstico Busa AI (modelo estadístico) y análisis técnico por plazo — RSI, MACD, Bandas de Bollinger, EMAs, SMA200 y ADX — para GGAL e YPF en BYMA.")
 
     ticker_tabs = st.tabs(["GGAL", "YPF"])
     with ticker_tabs[0]:
@@ -3361,12 +3508,12 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("Busa AI")
-    st.caption("Centro de inteligencia: señal actual, aprendizaje histórico, evaluación automática y explicación del modelo.")
+    st.caption("Centro de inteligencia: señal actual y explicación del modelo.")
 
     pred = dominant_prediction(prob)
     confidence = busa_ai_confidence_label(prob)
     strategy = busa_ai_recommended_strategy(pred, confidence)
-    acc, n_eval, d_eval = busa_ai_accuracy_summary(activo)
+    _, _, d_eval = busa_ai_accuracy_summary(activo)
 
     st.markdown("### Señal actual")
     c1, c2, c3, c4 = st.columns(4)
@@ -3397,48 +3544,6 @@ with tabs[3]:
     p2.metric("Baja", f"{prob['Baja']:.1%}")
     p3.metric("Lateral", f"{prob['Lateral']:.1%}")
 
-    st.markdown("### Aprendizaje visible")
-    st.caption("Evaluada=0 significa pendiente. Cuando se evalúa, Resultado y Acierto muestran si predijo bien o mal.")
-    l1, l2, l3 = st.columns(3)
-    l1.metric("Learning factor (clase dominante)", f"{prob.get('Learning factor', 1.0):.2f}")
-    l2.metric("Señales evaluadas (activo)", n_eval)
-    l3.metric("Accuracy histórico (activo)", "" if pd.isna(acc) else f"{acc*100:.1f}%")
-
-    if prob.get("Learning factor", 1.0) == 1.0:
-        st.info("El modelo todavía está cerca del neutral: necesita más señales evaluadas o el accuracy no justifica ajustar.")
-    elif prob.get("Learning factor", 1.0) > 1.0:
-        st.success("El modelo está reforzando la predicción dominante porque el historial viene acompañando.")
-    else:
-        st.warning("El modelo está moderando la predicción dominante porque el historial viene fallando.")
-
-    st.markdown("#### Detalle por clase (Sube / Baja / Lateral)")
-    st.caption("Cada clase se ajusta con su propio historial de aciertos (Bayesiano, no un umbral fijo). 'n' = señales evaluadas de esa clase específica; con pocas señales el factor queda cerca de 1.0.")
-    learning_stats = prob.get("Learning stats")
-    if learning_stats:
-        st.dataframe(pd.DataFrame([
-            {
-                "Clase": c,
-                "Factor": learning_stats[c]["factor"],
-                "n evaluadas": learning_stats[c]["n"],
-                "Accuracy cruda %": np.nan if pd.isna(learning_stats[c]["acc_raw"]) else learning_stats[c]["acc_raw"] * 100,
-                "Accuracy suavizada %": learning_stats[c]["acc_post"] * 100,
-            }
-            for c in ["Sube", "Baja", "Lateral"]
-        ]), use_container_width=True)
-    else:
-        st.info("Todavía no hay suficientes señales evaluadas por clase.")
-
-    quality = forecast_quality_summary(activo)
-    st.markdown("#### Calidad de calibración")
-    if quality is None:
-        st.info("Todavía no hay señales evaluadas para medir calibración.")
-    else:
-        q1, q2, q3 = st.columns(3)
-        q1.metric("Señales usadas", quality["n"])
-        q2.metric("Accuracy", "" if pd.isna(quality["accuracy"]) else f"{quality['accuracy']*100:.1f}%")
-        q3.metric("Brier score", "" if pd.isna(quality["brier"]) else f"{quality['brier']:.3f}")
-        st.caption("Brier score: 0 = probabilidades perfectamente calibradas, 2 = lo peor posible. Es más exigente que el accuracy porque también penaliza estar 'demasiado seguro' cuando se falla.")
-
     st.markdown("### Estrategias sugeridas por Busa AI")
     st.dataframe(pd.DataFrame(option_strategy_suggestions(pred, confidence)), use_container_width=True)
 
@@ -3455,13 +3560,6 @@ with tabs[3]:
         st.write(f"**Sesgo técnico aplicado:** {prob.get('Tilt técnico', 0)*100:.2f} puntos anualizados")
         st.write(f"**Volatilidad simple:** {prob.get('VH simple', hv)*100:.1f}% | **Volatilidad EWMA:** {prob.get('VH EWMA', hv)*100:.1f}% | **Volatilidad usada:** {hv*100:.1f}%")
         st.caption("El shrinkage evita que una racha corta de suba/baja se extrapole como si fuera a repetirse. Ajustable en la barra lateral, sección 'Modelo de pronóstico'.")
-
-    st.markdown("### Base vs ajustada por Learning")
-    st.dataframe(pd.DataFrame([
-        {"Escenario": "Sube", "Base %": prob.get("Sube base", prob["Sube"])*100, "Ajustada %": prob["Sube"]*100},
-        {"Escenario": "Baja", "Base %": prob.get("Baja base", prob["Baja"])*100, "Ajustada %": prob["Baja"]*100},
-        {"Escenario": "Lateral", "Base %": prob.get("Lateral base", prob["Lateral"])*100, "Ajustada %": prob["Lateral"]*100},
-    ]), use_container_width=True)
 
     st.markdown("### Acciones del motor")
     col_a, col_b = st.columns(2)
@@ -3701,6 +3799,21 @@ with tabs[5]:
             st.caption(f"El precio objetivo promedio de los analistas implica un {'potencial alcista' if upside >= 0 else 'potencial bajista'} de {abs(upside):.1f}% respecto del precio actual del ADR.")
 
         st.caption("Fuente: Yahoo Finance (ADR). Los fundamentales de la especie local en BYMA no suelen estar disponibles ahí, por eso se usa el ADR como referencia. Esto es información, no una recomendación de inversión.")
+
+        st.markdown(f"##### Noticias recientes — {fund_ticker_choice} ({adr_ticker})")
+        noticias = extract_news(get_news(adr_ticker), limit=8)
+        if not noticias:
+            st.info("No pude traer noticias en este momento (puede ser un corte temporal del proveedor).")
+        else:
+            for noticia in noticias:
+                titulo = f"[{noticia['Título']}]({noticia['URL']})" if noticia["URL"] else noticia["Título"]
+                st.write(f"📰 {titulo}")
+                meta = " · ".join(filter(None, [noticia["Fuente"], noticia["Fecha"]]))
+                if meta:
+                    st.caption(meta)
+                if noticia["Resumen"]:
+                    st.caption(noticia["Resumen"])
+            st.caption("Fuente: Yahoo Finance (agregador de medios: Reuters, GuruFocus, Motley Fool, etc.). Son noticias tal cual las publican esos medios -- no es un análisis ni una recomendación nuestra.")
 
     st.divider()
     st.markdown("### Simulador de escenarios (sin necesidad de cartera)")
@@ -4049,6 +4162,17 @@ with tabs[5]:
                                     f"Beta: {fund_pos['Beta']:.2f}" if fund_pos.get("Beta") else None,
                                 ])) or "💼 Sin más datos fundamentales disponibles.")
                                 st.caption("Fuente: Yahoo Finance sobre el ADR (afuera, en USD). Es la lectura de largo plazo del papel -- no está pensada para decidir el timing de una posición de opciones que vence en semanas, pero da contexto de si la baja reciente es de fondo o coyuntural.")
+
+                                noticias_pos = extract_news(get_news(adr_ticker_pos), limit=3)
+                                if noticias_pos:
+                                    st.markdown(f"**Últimas noticias de {extra['subyacente']}**")
+                                    for noticia_pos in noticias_pos:
+                                        titulo_pos = f"[{noticia_pos['Título']}]({noticia_pos['URL']})" if noticia_pos["URL"] else noticia_pos["Título"]
+                                        st.write(f"📰 {titulo_pos}")
+                                        meta_pos = " · ".join(filter(None, [noticia_pos["Fuente"], noticia_pos["Fecha"]]))
+                                        if meta_pos:
+                                            st.caption(meta_pos)
+                                    st.caption("Ver más en Favoritos → Análisis fundamental y ADR.")
 
                             st.markdown("**Valor esperado: mantener vs. cerrar ahora**")
                             v1, v2 = st.columns(2)
