@@ -224,6 +224,33 @@ def dominant_prediction(prob_dict):
     }
     return max(values, key=values.get)
 
+def consecutive_streak(close_series):
+    """
+    Racha de ruedas consecutivas en la misma dirección (Sube/Baja) hasta la
+    más reciente. Sirve para detectar cuando el precio viene moviéndose en
+    contra del pronóstico durante varias ruedas seguidas, algo que el modelo
+    estadístico (basado en promedios) puede tardar en reflejar.
+
+    Devuelve (direccion, n_ruedas). direccion es None si no hay racha clara
+    (última rueda sin cambio o datos insuficientes).
+    """
+    rets = close_series.dropna().diff().dropna()
+    if rets.empty:
+        return None, 0
+    last = float(rets.iloc[-1])
+    last_sign = 1 if last > 0 else (-1 if last < 0 else 0)
+    if last_sign == 0:
+        return None, 0
+    n = 0
+    for v in rets.iloc[::-1]:
+        sign = 1 if v > 0 else (-1 if v < 0 else 0)
+        if sign == last_sign:
+            n += 1
+        else:
+            break
+    direction = "Sube" if last_sign > 0 else "Baja"
+    return direction, n
+
 def technical_features(hist_df):
     """
     Calcula indicadores técnicos simples para registrar contexto del día.
@@ -238,6 +265,7 @@ def technical_features(hist_df):
         "Dist EMA50 %": np.nan,
         "ATR14 %": np.nan,
         "Volumen relativo": np.nan,
+        "ADX14": np.nan,
     }
     try:
         c = hist_df["Close"].dropna()
@@ -268,6 +296,15 @@ def technical_features(hist_df):
             vol = hist_df["Volume"].dropna()
             vol_rel = float(vol.iloc[-1] / vol.tail(20).mean()) if vol.tail(20).mean() else np.nan
 
+        adx_val = np.nan
+        if "High" in hist_df.columns and "Low" in hist_df.columns and len(c) >= 20:
+            try:
+                adx_series, _, _ = compute_adx(hist_df["High"], hist_df["Low"], hist_df["Close"])
+                adx_last = adx_series.dropna()
+                adx_val = float(adx_last.iloc[-1]) if not adx_last.empty else np.nan
+            except Exception:
+                adx_val = np.nan
+
         out.update({
             "RSI14": float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else np.nan,
             "Retorno 1d %": float(c.pct_change(1).iloc[-1] * 100),
@@ -276,6 +313,7 @@ def technical_features(hist_df):
             "Dist EMA50 %": float((c.iloc[-1] / ema50.iloc[-1] - 1) * 100),
             "ATR14 %": float(atr.iloc[-1] / c.iloc[-1] * 100) if not pd.isna(atr.iloc[-1]) else np.nan,
             "Volumen relativo": vol_rel,
+            "ADX14": adx_val,
         })
     except Exception:
         pass
@@ -765,6 +803,15 @@ def extract_fundamentals(info):
                 return v
         return None
 
+    # yfinance cambió en algún momento el formato de 'dividendYield': antes
+    # era una fracción (0.0412 = 4.12%), en versiones más nuevas a veces ya
+    # viene expresado en puntos porcentuales (4.12). Como el resto de la app
+    # multiplica por 100 para mostrarlo, sin esto un yield real de ~4% podía
+    # mostrarse como "412.00%". Se normaliza acá, en un solo lugar: si el
+    # valor crudo es mayor a 1, ya está en porcentaje (se lo pasa a fracción).
+    dy_raw = g("dividendYield")
+    dy_norm = (dy_raw / 100 if dy_raw > 1 else dy_raw) if dy_raw is not None else None
+
     return {
         "Precio ADR (USD)": g("currentPrice", "regularMarketPrice"),
         "Variación día %": g("regularMarketChangePercent"),
@@ -777,7 +824,7 @@ def extract_fundamentals(info):
         "P/E (trailing)": g("trailingPE"),
         "P/E (forward)": g("forwardPE"),
         "P/B": g("priceToBook"),
-        "Dividend Yield %": g("dividendYield"),
+        "Dividend Yield %": dy_norm,
         "ROE %": g("returnOnEquity"),
         "Margen neto %": g("profitMargins"),
         "Beta": g("beta"),
@@ -1063,7 +1110,14 @@ def _technical_tilt_score(feats):
     lo matiza levemente con contexto de corto plazo.
 
     - RSI extremo (sobrecompra/sobreventa): empuja levemente en sentido contrario
-      (reversión), con peso moderado.
+      (reversión), con peso moderado -- pero SÓLO si no hay una tendencia fuerte
+      confirmada por ADX. Antes este término pesaba igual siempre, lo que en una
+      baja sostenida (RSI bajo por estar realmente vendiéndose, no por un
+      sobreventa de corto plazo) sumaba sesgo alcista falso justo cuando el
+      papel seguía cayendo -- el motivo de que la app siguiera en "Sube" con
+      GGAL en baja 10 ruedas seguidas. Con ADX alto (tendencia real) se apaga
+      casi del todo, porque "comprar el sobreventa" no funciona en tendencias
+      fuertes.
     - Momentum 5 ruedas y distancia a EMA20/EMA50: empujan a favor de la
       tendencia reciente, con peso moderado y cap individual.
 
@@ -1076,9 +1130,18 @@ def _technical_tilt_score(feats):
     ret5 = feats.get("Retorno 5d %", np.nan)
     dist20 = feats.get("Dist EMA20 %", np.nan)
     dist50 = feats.get("Dist EMA50 %", np.nan)
+    adx = feats.get("ADX14", np.nan)
 
     if not pd.isna(rsi):
-        score += -(rsi - 50) / 50 * 0.05
+        rsi_weight = 0.05
+        if not pd.isna(adx):
+            if adx >= 30:
+                rsi_weight = 0.01
+            elif adx >= 25:
+                rsi_weight = 0.02
+            elif adx >= 20:
+                rsi_weight = 0.035
+        score += -(rsi - 50) / 50 * rsi_weight
     if not pd.isna(ret5):
         score += float(np.clip(ret5 / 100, -0.05, 0.05)) * 0.6
     if not pd.isna(dist20):
@@ -1099,6 +1162,13 @@ def prob_data(hist_df, horizon, lateral, lookback, drift_shrink=0.35, technical_
        (como antes) hace que rachas cortas de suba o baja se extrapolen de forma
        exagerada. Acá se lo multiplica por `drift_shrink` (0-1) y se lo acota,
        para que domine sólo parcialmente y no dispare probabilidades extremas.
+
+       Además, antes de aplicar el shrinkage, el retorno medio de la ventana
+       completa (`lookback`, ej. 60 ruedas) se mezcla con el retorno medio de
+       una ventana corta (10 ruedas). Sin esto, una racha sostenida de varias
+       ruedas en contra de la tendencia de fondo casi no mueve el promedio
+       largo, y el pronóstico puede seguir marcando "Sube" varias ruedas
+       después de que el papel ya viene bajando de forma sostenida.
 
     2) Volatilidad combinada: se mezcla el desvío simple de la ventana con un
        EWMA (más sensible a cambios recientes de volatilidad), en vez de usar
@@ -1121,8 +1191,12 @@ def prob_data(hist_df, horizon, lateral, lookback, drift_shrink=0.35, technical_
     hv = float(0.4 * hv_simple + 0.6 * hv_ewma) if hv_simple > 0 else hv_ewma
 
     mu_hist = float(lb.mean() * 252)
+    short_n = max(5, min(10, int(lookback)))
+    mu_short_raw = float(rets.tail(short_n).mean() * 252) if len(rets) >= short_n else mu_hist
+    mu_short = float(np.clip(mu_short_raw, -1.5, 1.5))
+    mu_blend = 0.6 * mu_hist + 0.4 * mu_short
     mu_cap = 0.60
-    mu_shrunk = float(np.clip(mu_hist * drift_shrink, -mu_cap, mu_cap))
+    mu_shrunk = float(np.clip(mu_blend * drift_shrink, -mu_cap, mu_cap))
 
     feats = {}
     tilt = 0.0
@@ -1148,6 +1222,7 @@ def prob_data(hist_df, horizon, lateral, lookback, drift_shrink=0.35, technical_
         "VH simple": hv_simple,
         "VH EWMA": hv_ewma,
         "Mu hist": mu_hist,
+        "Mu hist corto": mu_short,
         "Mu ajustada": mu,
         "Tilt técnico": tilt,
         "Sube": p_up,
@@ -1647,7 +1722,8 @@ def position_expected_value(typ, K, cantidad, prima_actual, S, T, mu, hv):
 
 
 def recommend_option_action(typ, cantidad, dias_venc, extrinsic, prima_actual, ppc, prob_dict, veredicto_tecnico,
-                             valor_esperado_mantener=None, valor_cierre_ahora=None, liquidez=None):
+                             valor_esperado_mantener=None, valor_cierre_ahora=None, liquidez=None,
+                             racha_direccion=None, racha_dias=0):
     """
     Recomendación simple y transparente (MANTENER / VIGILAR / VENDER) para una
     posición de opciones en cartera. Combina:
@@ -1661,6 +1737,12 @@ def recommend_option_action(typ, cantidad, dias_venc, extrinsic, prima_actual, p
       (integrando contra el mismo modelo lognormal que usa el Advisor).
     - Liquidez de esta opción puntual (no del papel): si es muy baja, cuesta
       más salir a buen precio.
+    - Racha de ruedas consecutivas del subyacente en contra de la posición
+      (`racha_direccion`/`racha_dias`, de `consecutive_streak`): el pronóstico
+      Busa AI se basa en promedios y puede tardar varias ruedas en reflejar un
+      cambio de tendencia sostenido. Esta señal es independiente de eso y
+      penaliza de forma creciente cuanto más larga la racha en contra, para
+      frenar el impulso de promediar posición mientras el papel sigue cayendo.
 
     No es asesoramiento financiero personalizado: es una lectura basada en
     reglas explícitas, pensada para acompañar la decisión, no reemplazarla.
@@ -1726,6 +1808,16 @@ def recommend_option_action(typ, cantidad, dias_venc, extrinsic, prima_actual, p
     if liquidez is not None and not np.isnan(liquidez) and liquidez < 35:
         score -= 0.25
         razones.append(f"Liquidez baja en esta opción puntual ({liquidez:.0f}/100): podría costar salir a buen precio.")
+
+    if racha_direccion is not None and racha_dias and racha_dias >= 5 and racha_direccion == contraria:
+        penalty = min(1.5, 0.2 * racha_dias)
+        score -= penalty
+        razones.append(
+            f"⚠️ El subyacente lleva {int(racha_dias)} ruedas seguidas en {racha_direccion.lower()}, "
+            "en contra de la posición: el pronóstico estadístico puede estar retrasado respecto de esta "
+            "racha reciente. No se recomienda promediar posición hasta que la racha se corte o el "
+            "veredicto técnico deje de estar en contra."
+        )
 
     pnl_pct = np.nan
     if ppc is not None and not np.isnan(ppc) and ppc > 0 and prima_actual is not None and not np.isnan(prima_actual):
@@ -3286,6 +3378,19 @@ with tabs[3]:
     ultimo_dato_ai = pd.to_datetime(close.index[-1]).strftime("%d/%m/%Y")
     st.caption(f"🕒 Predicción generada: {generado_ai} hs. | Datos de precio hasta: {ultimo_dato_ai}")
 
+    racha_dir_ai, racha_n_ai = consecutive_streak(close)
+    if racha_n_ai >= 5 and racha_dir_ai is not None:
+        contradice_racha = (racha_dir_ai == "Baja" and pred == "Sube") or (racha_dir_ai == "Sube" and pred == "Baja")
+        if contradice_racha:
+            st.error(
+                f"⚠️ {activo} lleva {racha_n_ai} ruedas seguidas en {racha_dir_ai.lower()} y el pronóstico "
+                f"sigue en **{pred}**. El modelo se basa en promedios y puede tardar en reflejar un cambio "
+                "de tendencia sostenido -- revisá el veredicto técnico (pestaña Probabilidades) antes de "
+                "sumar o promediar posición."
+            )
+        else:
+            st.info(f"📈 {activo} lleva {racha_n_ai} ruedas seguidas en {racha_dir_ai.lower()}, en línea con el pronóstico.")
+
     st.markdown("### Probabilidades")
     p1, p2, p3 = st.columns(3)
     p1.metric("Sube", f"{prob['Sube']:.1%}")
@@ -3344,8 +3449,9 @@ with tabs[3]:
 
     with st.expander("Cómo se arma el pronóstico (drift y volatilidad)", expanded=False):
         st.caption("Desglose del modelo estadístico antes de aplicar el ajuste de Learning.")
-        st.write(f"**Retorno histórico anualizado (crudo):** {prob.get('Mu hist', 0)*100:.1f}%")
-        st.write(f"**Retorno usado en el modelo (con shrinkage + sesgo técnico):** {prob.get('Mu ajustada', 0)*100:.1f}%")
+        st.write(f"**Retorno histórico anualizado, ventana larga ({int(lookback)} ruedas):** {prob.get('Mu hist', 0)*100:.1f}%")
+        st.write(f"**Retorno histórico anualizado, ventana corta (~10 ruedas):** {prob.get('Mu hist corto', 0)*100:.1f}%")
+        st.write(f"**Retorno usado en el modelo (mezcla larga/corta + shrinkage + sesgo técnico):** {prob.get('Mu ajustada', 0)*100:.1f}%")
         st.write(f"**Sesgo técnico aplicado:** {prob.get('Tilt técnico', 0)*100:.2f} puntos anualizados")
         st.write(f"**Volatilidad simple:** {prob.get('VH simple', hv)*100:.1f}% | **Volatilidad EWMA:** {prob.get('VH EWMA', hv)*100:.1f}% | **Volatilidad usada:** {hv*100:.1f}%")
         st.caption("El shrinkage evita que una racha corta de suba/baja se extrapole como si fuera a repetirse. Ajustable en la barra lateral, sección 'Modelo de pronóstico'.")
@@ -3799,9 +3905,12 @@ with tabs[5]:
                     typ, strike, pos.get("Cantidad"), prima_actual, S_pos, T_pos, prob_pos.get("Mu ajustada", 0.0), hv_pos
                 )
 
+                racha_direccion_pos, racha_dias_pos = consecutive_streak(close_pos)
+
                 accion, score_pos, razones_pos, pnl_pct = recommend_option_action(
                     typ, pos.get("Cantidad"), dias_venc_pos, extrinsic_pos, prima_actual, pos.get("PPC"),
                     prob_pos, veredicto_pos, valor_esperado_mantener, valor_cierre_ahora, liquidez_pos,
+                    racha_direccion_pos, racha_dias_pos,
                 )
 
                 resultados.append({
@@ -3916,6 +4025,31 @@ with tabs[5]:
                             if extra.get("volumen_pos_series") is not None:
                                 st.write(f"📦 {volume_expert_reading(extra['volumen_pos_series'], extra['close_pos'])}")
 
+                            adr_ticker_pos = TICKERS.get(extra["subyacente"], {}).get("adr")
+                            fund_pos = extract_fundamentals(get_fundamentals(adr_ticker_pos)) if adr_ticker_pos else {}
+                            if fund_pos and fund_pos.get("Precio ADR (USD)") is not None:
+                                st.markdown(f"**Fundamentales de {extra['subyacente']} (ADR {adr_ticker_pos}, largo plazo -- independiente del pronóstico de corto plazo)**")
+                                precio_adr = fund_pos["Precio ADR (USD)"]
+                                hi52 = fund_pos.get("Máx. 52 sem.")
+                                lo52 = fund_pos.get("Mín. 52 sem.")
+                                if hi52 and lo52 and hi52 > lo52:
+                                    pos_rango = (precio_adr - lo52) / (hi52 - lo52) * 100
+                                    st.write(f"📊 ADR en US$ {precio_adr:.2f}, en el {pos_rango:.0f}% de su rango de 52 semanas (US$ {lo52:.2f} - US$ {hi52:.2f}).")
+                                target = fund_pos.get("Precio objetivo analistas (USD)")
+                                rec = fund_pos.get("Recomendación analistas")
+                                n_an = fund_pos.get("Cantidad analistas")
+                                if target:
+                                    dist_target = (target / precio_adr - 1) * 100 if precio_adr else np.nan
+                                    st.write(f"🎯 Precio objetivo promedio de analistas: US$ {target:.2f} ({dist_target:+.1f}% vs. ADR actual)" + (f", recomendación consenso: **{rec}**" if rec else "") + (f" ({int(n_an)} analistas)" if n_an else "") + ".")
+                                pe = fund_pos.get("P/E (trailing)")
+                                dy = fund_pos.get("Dividend Yield %")
+                                st.write("💼 " + " · ".join(filter(None, [
+                                    f"P/E: {pe:.1f}" if pe else None,
+                                    f"Dividend yield: {dy*100:.2f}%" if dy else None,
+                                    f"Beta: {fund_pos['Beta']:.2f}" if fund_pos.get("Beta") else None,
+                                ])) or "💼 Sin más datos fundamentales disponibles.")
+                                st.caption("Fuente: Yahoo Finance sobre el ADR (afuera, en USD). Es la lectura de largo plazo del papel -- no está pensada para decidir el timing de una posición de opciones que vence en semanas, pero da contexto de si la baja reciente es de fondo o coyuntural.")
+
                             st.markdown("**Valor esperado: mantener vs. cerrar ahora**")
                             v1, v2 = st.columns(2)
                             vem = extra.get("valor_esperado_mantener", np.nan)
@@ -3926,6 +4060,39 @@ with tabs[5]:
                             if not pd.isna(extra.get("compra_op", np.nan)) and not pd.isna(extra.get("venta_op", np.nan)):
                                 liq_txt += f" | Compra {extra['compra_op']:.2f} / Venta {extra['venta_op']:.2f}"
                             st.caption(liq_txt)
+
+                            st.markdown("**Probabilidad de recuperar (llegar o superar tu PPC antes del vencimiento)**")
+                            ppc_recup = r_row["PPC"]
+                            dias_venc_recup = extra.get("dias_venc_pos")
+                            S_recup = extra.get("S_pos")
+                            hv_recup = extra.get("hv_pos")
+                            strike_recup = extra.get("strike")
+                            typ_recup = extra.get("typ")
+                            mu_recup = extra.get("prob_pos", {}).get("Mu ajustada", 0.0)
+                            prob_recup = ev_recup = np.nan
+                            if (not pd.isna(ppc_recup) and dias_venc_recup is not None and not pd.isna(dias_venc_recup)
+                                    and S_recup and not pd.isna(S_recup) and hv_recup and hv_recup > 0
+                                    and strike_recup and not pd.isna(strike_recup)):
+                                T_recup = max(dias_venc_recup, 0) / 365
+                                if T_recup > 0:
+                                    prices_recup = np.linspace(max(S_recup * 0.3, 1), S_recup * 2.5, 400)
+                                    vendida_recup = not pd.isna(r_row["Cantidad"]) and r_row["Cantidad"] < 0
+                                    payoff_recup = leg_payoff(prices_recup, typ_recup, strike_recup, ppc_recup, "sell" if vendida_recup else "buy")
+                                    prob_recup, ev_recup = strategy_probability_and_ev(payoff_recup, prices_recup, S_recup, T_recup, mu_recup, hv_recup)
+                            if not pd.isna(prob_recup):
+                                r1, r2 = st.columns(2)
+                                r1.metric("Prob. de terminar por encima de tu PPC", f"{prob_recup:.0%}")
+                                r2.metric("Resultado esperado (payoff neto)", "" if pd.isna(ev_recup) else f"{ev_recup:,.2f}")
+                                st.caption(
+                                    f"Integra el mismo modelo lognormal del pronóstico (drift {mu_recup*100:+.1f}% anualizado, "
+                                    f"volatilidad {hv_recup*100:.1f}%) contra todos los precios posibles del papel al vencimiento "
+                                    f"({int(dias_venc_recup)} días), incluyendo escenarios de rebote. Es una probabilidad estadística "
+                                    "bajo los supuestos del modelo vigente, no una garantía -- el drift puede cambiar entre hoy y el "
+                                    "vencimiento. Misma métrica que usa el Advisor para rankear estrategias, aplicada a tu posición actual; "
+                                    "no es asesoramiento financiero personalizado."
+                                )
+                            else:
+                                st.caption("No pude calcular la probabilidad de recuperación (faltan datos de PPC, strike, precio o volatilidad para esta posición).")
 
                             st.markdown("**Cuánto tiene que moverse el papel — semana a semana**")
                             ppc_ref = r_row["PPC"] if not pd.isna(r_row["PPC"]) else extra.get("theo_pos", np.nan)
